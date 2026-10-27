@@ -1,0 +1,1 @@
+"""Standalone GorkyCode application package."""

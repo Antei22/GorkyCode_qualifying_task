@@ -1,0 +1,74 @@
+name: gorkycode
+services:
+  gpt2giga:
+    profiles: [gigachat]
+    build: ./gpt2giga
+    environment:
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS:-}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GPT2GIGA_MODE: PROD
+      GPT2GIGA_HOST: 0.0.0.0
+      GPT2GIGA_PORT: 8090
+      GPT2GIGA_ENABLE_API_KEY_AUTH: "true"
+      GPT2GIGA_API_KEY: ${LLM_API_KEY:-configure-me}
+    volumes:
+      - gorky_proxy_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1',8090),5).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gorky}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gorky-local-only}
+      POSTGRES_DB: ${POSTGRES_DB:-gorky}
+    volumes:
+      - gorky_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gorky}:${POSTGRES_PASSWORD:-gorky-local-only}@db:5432/${POSTGRES_DB:-gorky}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      APP_FIXED_NOW: ${APP_FIXED_NOW:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8090/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-GigaChat-3-Lightning}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-45}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+    ports:
+      - "127.0.0.1:8010:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+volumes:
+  gorky_data:
+  gorky_proxy_data:
