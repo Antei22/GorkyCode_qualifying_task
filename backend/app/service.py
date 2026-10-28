@@ -22,28 +22,61 @@ class Service:
                     raise DomainError('Этот request_id уже использован для другого сообщения.')
                 return previous['response']
             tools = Tools(self.repo, con, owner, self.clock, session['pending'])
-            if message.strip().lower() in ('отмена', 'отмени', 'отменить'):
+            cancelled = False
+
+            cancel_phrases = {
+                'отмена',
+                'отмени',
+                'отменить',
+                'отмени создание',
+                'отмени черновик',
+            }
+
+            if message.strip().lower() in cancel_phrases:
+                pending = tools.pending or {}
+                kind_labels = {
+                    'task': 'задачи',
+                    'meeting': 'встречи',
+                    'reminder': 'напоминания',
+                }
+                if pending:
+                    kind_label = kind_labels.get(pending.get('kind'), 'записи')
+                    cancel_answer = f'Черновик создания {kind_label} отменён.'
+                else:
+                    cancel_answer = 'Незавершённого черновика нет.'
                 tools.save_pending(None)
-                answer = 'Черновик отменён.'
+                cancelled = True
+                answer = cancel_answer
             else:
-                answer = self.assistant.answer(message, self.repo.history(con, owner), tools)
+                answer = self.assistant.answer(
+                    message,
+                    self.repo.history(con, owner),
+                    tools,
+                )
             # Server-generated confirmations are attached to committed record data.
-            if tools.created:
-                labels = {'task': 'Задача сохранена', 'meeting': 'Встреча сохранена', 'reminder': 'Напоминание сохранено'}
+            if cancelled:
+                answer = cancel_answer
+            elif tools.created:
+                labels = {'task': 'Задача сохранена',
+                          'meeting': 'Встреча сохранена',
+                          'reminder': 'Напоминание сохранено'
+                }
                 answer = '\n'.join(f"{labels[r['kind']]}: «{r['text']}» — "
                     f"{r['scheduled_date'] or 'без даты'} {r['scheduled_time'] or ''}" for r in tools.created)
             elif tools.questions:
-                answer = tools.questions[-1]
+                if tools.response_mode != 'clarification' or not answer or not answer.strip():
+                    answer = tools.questions[-1]
             elif tools.errors:
                 answer = tools.errors[-1]
             elif tools.read_count:
                 rows = list(tools.found.values())
-                answer = ('Найдены записи:\n' + '\n'.join(
-                    f"• {r['text']} — {r['scheduled_date'] or 'без даты'} {r['scheduled_time'] or ''}"
-                    + (' (тип в исходных данных не указан)' if r['kind'] is None else '')
-                    for r in rows)) if rows else 'По запросу записей не найдено.'
-                if len(rows) >= tools.result_limit:
-                    answer += '\nВыдача ограничена. Уточните запрос для более точного результата.'
+                if tools.response_mode != 'read' or not answer or not answer.strip():
+                    answer = ('Найдены записи:\n' + '\n'.join(
+                        f"• {r['text']} — {r['scheduled_date'] or 'без даты'} {r['scheduled_time'] or ''}"
+                        + (' (тип в исходных данных не указан)' if r['kind'] is None else '')
+                        for r in rows)) if rows else 'По запросу записей не найдено.'
+                    if len(rows) >= tools.result_limit:
+                        answer += '\nВыдача ограничена. Уточните запрос для более точного результата.'
             else:
                 # A model-only claim is not evidence that an operation happened.
                 answer = ('Я могу создать задачу, встречу или напоминание, показать расписание '

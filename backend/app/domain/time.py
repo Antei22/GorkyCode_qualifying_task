@@ -3,6 +3,7 @@
 Never derives 'today' from the maximum date in an imported dataset.
 """
 import re
+from calendar import monthrange
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from .models import DomainError
@@ -44,8 +45,14 @@ def parse_day(expression, now):
         return now.date() + timedelta(days=offsets[value])
     if value in ('до конца недели', 'конец недели', 'в конце недели'):
         return now.date() + timedelta(days=6 - now.weekday())
+    if value in ('до конца месяца', 'конец месяца', 'в конце месяца'):
+        return date(now.year, now.month, monthrange(now.year, now.month)[1])
     if value in ('на следующей неделе', 'следующая неделя'):
         raise DomainError('Какой день следующей недели выбрать?')
+    next_weekday = re.fullmatch(r'(?:в|во)?\s*следующ(?:ий|ую|ее)\s+([а-я]+)', value)
+    if next_weekday and next_weekday[1] in WEEKDAYS:
+        next_monday = now.date() + timedelta(days=7 - now.weekday())
+        return next_monday + timedelta(days=WEEKDAYS[next_weekday[1]])
     weekday = re.sub(r'^(в|во)\s+', '', value)
     if weekday in WEEKDAYS:
         return now.date() + timedelta(days=(WEEKDAYS[weekday] - now.weekday()) % 7)
@@ -55,10 +62,19 @@ def parse_day(expression, now):
         pass
     match = re.fullmatch(r'(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?', value)
     if match and match[2] in MONTHS:
-        try:
-            return date(int(match[3] or now.year), MONTHS[match[2]], int(match[1]))
-        except ValueError as error:
-            raise DomainError('Такой календарной даты нет.') from error
+        if match[3]:
+            try:
+                return date(int(match[3]), MONTHS[match[2]], int(match[1]))
+            except ValueError as error:
+                raise DomainError('Такой календарной даты нет.') from error
+        for year in range(now.year, now.year + 9):
+            try:
+                result = date(year, MONTHS[match[2]], int(match[1]))
+            except ValueError:
+                continue
+            if result >= now.date():
+                return result
+        raise DomainError('Такой календарной даты нет.')
     raise DomainError('Уточните дату: например, «завтра», «в пятницу» или YYYY-MM-DD.')
 
 
@@ -85,6 +101,12 @@ def parse_time(expression):
 
 def schedule(day_expression, time_expression, now):
     value = (day_expression or '').strip().lower()
+    if value == 'через полчаса':
+        moment = now + timedelta(minutes=30)
+        return moment.date(), moment.time().replace(second=0, microsecond=0, tzinfo=None)
+    if value in ('через неделю', 'через одну неделю'):
+        moment = now + timedelta(days=7)
+        return moment.date(), moment.time().replace(second=0, microsecond=0, tzinfo=None)
     for word, number in NUMBERS.items():
         value = re.sub(rf'\b{word}\b', str(number), value)
     match = re.fullmatch(r'через\s+(\d+)\s*(час|часа|часов|минуту|минуты|минут)', value)

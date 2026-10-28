@@ -17,8 +17,27 @@ class TimeTests(unittest.TestCase):
         self.assertEqual(parse_day('в пятницу', self.now), date(2026, 10, 30))
         self.assertEqual(parse_day('до конца недели', self.now), date(2026, 11, 1))
 
+    def test_next_weekday_and_end_of_month(self):
+        self.assertEqual(parse_day('в следующую пятницу', self.now), date(2026, 11, 6))
+        self.assertEqual(parse_day('в конце месяца', self.now), date(2026, 10, 31))
+        with self.assertRaisesRegex(DomainError, 'Какой день'):
+            parse_day('на следующей неделе', self.now)
+
     def test_relative_hours(self):
         self.assertEqual(schedule('через два часа', '', self.now), (date(2026, 10, 27), time(14)))
+
+    def test_half_hour_week_and_midnight_boundary(self):
+        late = Clock(fixed_now='2026-12-31T23:45:00+03:00').now()
+        self.assertEqual(schedule('через полчаса', '', late),
+                         (date(2027, 1, 1), time(0, 15)))
+        self.assertEqual(schedule('через неделю', '', late),
+                         (date(2027, 1, 7), time(23, 45)))
+
+    def test_day_without_year_moves_to_next_year_when_already_passed(self):
+        end_of_year = Clock(fixed_now='2026-12-31T12:00:00+03:00').now()
+        self.assertEqual(parse_day('1 января', end_of_year), date(2027, 1, 1))
+        self.assertEqual(parse_day('31 декабря', end_of_year), date(2026, 12, 31))
+        self.assertEqual(parse_day('29 февраля', end_of_year), date(2028, 2, 29))
 
     def test_week_boundaries(self):
         self.assertEqual(period_bounds('this_week', self.now), (date(2026, 10, 26), date(2026, 11, 1)))
@@ -33,8 +52,9 @@ class TimeTests(unittest.TestCase):
         for value in ('31 февраля', 'на следующей неделе', 'какой-нибудь день'):
             with self.assertRaises(DomainError):
                 parse_day(value, self.now)
-        with self.assertRaises(DomainError):
-            parse_time('25:70')
+        for value in ('25:70', 'вечером', 'утром', 'после обеда'):
+            with self.assertRaises(DomainError):
+                parse_time(value)
 
     def test_fixed_clock_is_converted_to_timezone(self):
         self.assertEqual(Clock(fixed_now='2026-10-27T23:30:00+00:00').now().date(), date(2026, 10, 28))
