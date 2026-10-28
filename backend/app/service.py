@@ -47,6 +47,26 @@ class Service:
                 tools.save_pending(None)
                 cancelled = True
                 answer = cancel_answer
+            elif ((tools.pending or {}).get('_suggested_slot') and
+                  message.strip().lower().strip(' !.,?') in {
+                      'да', 'давай', 'подтверждаю', 'подтвердить', 'подходит',
+                      'согласен', 'согласна', 'хорошо', 'ок', 'окей',
+                  }):
+                suggestion = tools.pending['_suggested_slot']
+                tools.call('create_record', {
+                    'mode': 'continue',
+                    **suggestion,
+                })
+                answer = ''
+            elif ((tools.pending or {}).get('_suggested_slot') and
+                  message.strip().lower().strip(' !.,?') in {
+                      'нет', 'не надо', 'не подходит', 'другое время',
+                      'не согласен', 'не согласна',
+                  }):
+                pending = dict(tools.pending)
+                pending.pop('_suggested_slot', None)
+                tools.save_pending(pending)
+                answer = 'Хорошо. Укажите другое время для встречи.'
             else:
                 answer = self.assistant.answer(
                     message,
@@ -62,7 +82,12 @@ class Service:
                           'reminder': 'Напоминание сохранено'
                 }
                 answer = '\n'.join(f"{labels[r['kind']]}: «{r['text']}» — "
-                    f"{r['scheduled_date'] or 'без даты'} {r['scheduled_time'] or ''}" for r in tools.created)
+                    f"{r['scheduled_date'] or 'без даты'} {r['scheduled_time'] or ''}"
+                    for r in tools.created)
+            elif tools.cancelled:
+                answer = '\n'.join(
+                    f"Запись отменена: «{r['text']}» — {r['scheduled_date'] or 'без даты'} {r['scheduled_time'] or ''}"
+                    for r in tools.cancelled)
             elif tools.questions:
                 if tools.response_mode != 'clarification' or not answer or not answer.strip():
                     answer = tools.questions[-1]
@@ -85,7 +110,7 @@ class Service:
                 'sources': [{'type': r['kind'] or 'import', 'title': str(r['id']),
                              'evidence': f"{r['text']} — {r['scheduled_date']} {r['scheduled_time'] or ''}"}
                             for r in list(tools.found.values())[:20]],
-                'records': tools.created or list(tools.found.values()),
+                'records': tools.created or tools.cancelled or list(tools.found.values()),
                 'pending': tools.pending})
             self.repo.remember(con, owner, 'user', message)
             self.repo.remember(con, owner, 'assistant', answer)

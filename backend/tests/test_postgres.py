@@ -64,6 +64,15 @@ class MultiStepAssistant:
             'mode': 'start', 'kind': 'task', 'text': 'Отправить отчёт',
             'date_expression': 'в пятницу',
         },
+        'встреча с дизайнером': {
+            'mode': 'start', 'kind': 'meeting', 'text': 'Встреча с дизайнером',
+            'date_expression': 'завтра', 'time_expression': '11:00',
+        },
+        'созвониться с Катей': {
+            'mode': 'start', 'kind': 'meeting', 'text': 'Созвониться с Катей',
+            'date_expression': 'завтра', 'time_expression': '11:00',
+        },
+        'в 12': {'mode': 'continue', 'time_expression': '12:00'},
     }
 
     def answer(self, message, history, tools):
@@ -199,6 +208,30 @@ class PostgresTests(unittest.TestCase):
         self.assertEqual(past_date['pending']['text'], 'Позвонить Ивану')
         self.assertNotIn('date_expression', past_date['pending'])
         self.assertEqual(len(self.rows()), 0)
+
+    def test_meeting_conflict_keeps_draft_and_accepts_another_time(self):
+        service = Service(self.repo, MultiStepAssistant(), self.clock)
+        first = service.chat(self.owners[0], uuid4(), 'встреча с дизайнером')
+        self.assertIn('Встреча сохранена', first['answer'])
+
+        conflict = service.chat(self.owners[0], uuid4(), 'созвониться с Катей')
+
+        self.assertEqual(
+            conflict['answer'],
+            'На 28.10.2026 в 11:00 уже запланирована встреча '
+            '«Встреча с дизайнером». Укажите другое время.',
+        )
+        self.assertEqual(conflict['pending']['text'], 'Созвониться с Катей')
+        self.assertEqual(conflict['pending']['time_expression'], '11:00')
+        self.assertEqual(len(self.rows()), 1)
+
+        moved = service.chat(self.owners[0], uuid4(), 'в 12')
+
+        self.assertIn('Встреча сохранена', moved['answer'])
+        self.assertIsNone(moved['pending'])
+        rows = {row['text']: row for row in self.rows()}
+        self.assertEqual(str(rows['Встреча с дизайнером']['scheduled_time']), '11:00:00')
+        self.assertEqual(str(rows['Созвониться с Катей']['scheduled_time']), '12:00:00')
 
     def test_new_creation_does_not_merge_with_pending_draft(self):
         service = Service(self.repo, MultiStepAssistant(), self.clock)

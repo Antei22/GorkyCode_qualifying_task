@@ -1,7 +1,7 @@
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from psycopg.types.json import Jsonb
 from app.domain.models import DomainError, Kind, RecordDraft
 from app.domain.time import parse_time, period_bounds, schedule
@@ -12,6 +12,20 @@ PENDING_TTL = timedelta(minutes=30)
 
 class Arguments(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+
+    @field_validator('kind', mode='before', check_fields=False)
+    @classmethod
+    def normalize_kind(cls, value):
+        if not isinstance(value, str):
+            return value
+        aliases = {
+            'task': 'task', 'задача': 'task', 'задачу': 'task', 'задачи': 'task',
+            'meeting': 'meeting', 'встреча': 'meeting', 'встречу': 'meeting',
+            'встречи': 'meeting', 'созвон': 'meeting',
+            'reminder': 'reminder', 'напоминание': 'reminder',
+            'напоминания': 'reminder',
+        }
+        return aliases.get(value.strip().lower().replace('ё', 'е'), value)
 
 
 class CreateRecord(Arguments):
@@ -32,6 +46,8 @@ class CreateRecord(Arguments):
                                         description='Выражение даты словами пользователя')
     time_expression: str | None = Field(default=None, max_length=50,
                                         description='Выражение времени словами пользователя')
+    duration_minutes: int | None = Field(default=None, ge=5, le=480,
+                                         description='Явно названная длительность события в минутах')
 
 
 class ListRecords(Arguments):
@@ -51,13 +67,20 @@ class SearchRecords(Arguments):
     kind: Kind | None = None
 
 
+class CancelRecord(Arguments):
+    """Отменить существующую запись по краткому описанию. Если найдено несколько записей, запросить уточнение."""
+    query: str = Field(min_length=1, max_length=300,
+                       description='Ключевые слова из описания отменяемой записи')
+
+
 class AskClarification(Arguments):
     """Уточнить неоднозначный запрос. Ничего не создаёт."""
     question: str = Field(min_length=1, max_length=500)
 
 
 MODELS = {'create_record': CreateRecord, 'list_records': ListRecords,
-          'search_records': SearchRecords, 'ask_clarification': AskClarification}
+          'search_records': SearchRecords, 'cancel_record': CancelRecord,
+          'ask_clarification': AskClarification}
 
 
 def specifications():
@@ -72,6 +95,7 @@ class Tools:
         self.pending = pending
         self.expired_pending = False
         self.created = []
+        self.cancelled = []
         self.found = {}
         self.questions = []
         self.errors = []
@@ -100,9 +124,17 @@ class Tools:
         try:
             args = MODELS[name].model_validate(arguments)
             return getattr(self, name)(args)
-        except (DomainError, ValidationError) as error:
+        except DomainError as error:
             self.errors.append(str(error))
             return {'error': str(error)}
+        except ValidationError as error:
+            fields = {str(item['loc'][-1]) for item in error.errors() if item.get('loc')}
+            if 'kind' in fields:
+                message = 'Уточните тип записи: задача, встреча или напоминание.'
+            else:
+                message = 'Не удалось разобрать параметры запроса. Переформулируйте его.'
+            self.errors.append(message)
+            return {'error': message}
 
     def save_pending(self, pending):
         if pending:
@@ -114,6 +146,56 @@ class Tools:
         self.con.execute('UPDATE sessions SET pending=%s WHERE id=%s',
                          (Jsonb(pending) if pending else None, self.owner))
 
+    @staticmethod
+    def _meeting_duration(text, explicit=None):
+        if explicit is not None:
+            return explicit
+        value = text.lower().replace('ё', 'е')
+        if any(word in value for word in ('конференц', 'воркшоп', 'тренинг', 'презентац')):
+            return 120
+        if any(word in value for word in ('деловая встреча', 'совещан', 'переговор', 'интервью')):
+            return 90
+        if any(word in value for word in ('созвон', 'звонок', 'позвонить', 'созвониться', 'телефон')):
+            return 30
+        return 60
+
+    def _nearest_free_slot(self, requested, duration_minutes):
+        first = requested.date()
+        last = first + timedelta(days=30)
+        meetings = self.repo.meetings_between(self.con, self.owner, first, last)
+        by_day = {}
+        for meeting in meetings:
+            start_day = meeting['scheduled_date']
+            start_time = meeting['scheduled_time']
+            start = datetime.combine(start_day, start_time)
+            length = meeting.get('duration_minutes') or 60
+            end = start + timedelta(minutes=length)
+            by_day.setdefault(start_day, []).append((start, end, meeting))
+
+        requested_end = requested + timedelta(minutes=duration_minutes)
+        initial_conflicts = [item for item in by_day.get(requested.date(), [])
+                             if item[0] < requested_end and item[1] > requested]
+        if not initial_conflicts:
+            return None, None
+
+        for offset in range(31):
+            day = first + timedelta(days=offset)
+            if day.weekday() >= 5:
+                continue
+            opening = datetime.combine(day, time(9, 0))
+            closing = datetime.combine(day, time(18, 0))
+            candidate = max(requested, opening)
+            if candidate >= closing or candidate + timedelta(minutes=duration_minutes) > closing:
+                continue
+            while candidate + timedelta(minutes=duration_minutes) <= closing:
+                end = candidate + timedelta(minutes=duration_minutes)
+                overlaps = [item for item in by_day.get(day, [])
+                            if item[0] < end and item[1] > candidate]
+                if not overlaps:
+                    return initial_conflicts[0][2], candidate
+                candidate = max(item[1] for item in overlaps)
+        return initial_conflicts[0][2], None
+
     def create_record(self, args):
         if args.mode == 'continue':
             if not self.pending:
@@ -121,12 +203,15 @@ class Tools:
                     raise DomainError('Черновик устарел. Начните создание заново.')
                 raise DomainError('Нет незавершённого черновика. Начните создание заново.')
             data = dict(self.pending)
+            data.pop('_suggested_slot', None)
+            data.pop('created_at', None)
+            data.pop('updated_at', None)
         else:
             data = {}
         original_data = dict(data)
 
         supplied = args.model_dump(exclude_none=True, exclude={'mode'})
-        for key in ('kind', 'text'):
+        for key in ('kind', 'text', 'duration_minutes'):
             if key in supplied:
                 data[key] = supplied[key]
 
@@ -201,8 +286,42 @@ class Tools:
             self.response_mode = 'clarification'
             return {'needs_clarification': True, 'missing_field': missing[0],
                     'suggested_question': question, 'draft': self.pending}
+        if data['kind'] == 'meeting':
+            duration = self._meeting_duration(data['text'], data.get('duration_minutes'))
+            requested = datetime.combine(day, moment)
+            conflict, nearest = self._nearest_free_slot(requested, duration)
+            if conflict:
+                data['duration_minutes'] = duration
+                if nearest:
+                    data['_suggested_slot'] = {
+                        'date_expression': nearest.date().isoformat(),
+                        'time_expression': nearest.strftime('%H:%M'),
+                        'duration_minutes': duration,
+                    }
+                self.save_pending(data)
+                if nearest:
+                    question = (
+                        f"На {day.strftime('%d.%m.%Y')} в {moment.strftime('%H:%M')} "
+                        f"уже запланирована встреча «{conflict['text']}». "
+                        f"Ближайшее свободное время — {nearest.strftime('%d.%m.%Y в %H:%M')}. "
+                        f"Подтвердить?"
+                    )
+                else:
+                    data.pop('_suggested_slot', None)
+                    self.save_pending(data)
+                    question = ('В ближайшие 30 дней не нашлось свободного времени '
+                                'в рабочие часы. Укажите другую дату и время.')
+                self.questions.append(question)
+                return {'needs_confirmation': bool(nearest),
+                        'missing_field': 'confirmation' if nearest else 'time',
+                        'suggested_question': question,
+                        'suggested_slot': data.get('_suggested_slot'),
+                        'draft': self.pending}
+            data['duration_minutes'] = duration
         draft = RecordDraft(kind=data['kind'], text=data['text'], scheduled_date=day,
-                            scheduled_time=moment, timezone=self.clock.zone.key)
+                            scheduled_time=moment,
+                            duration_minutes=data.get('duration_minutes'),
+                            timezone=self.clock.zone.key)
         signature = draft.model_dump_json()
         if signature in self.signatures:
             return {'created': self.signatures[signature], 'reused': True}
@@ -230,6 +349,24 @@ class Tools:
         self.found.update({str(row['id']): row for row in rows})
         return {'records': rows, 'limit': 20, 'includes_past': True,
                 'note': 'Неизвестный тип импорта не доказывает, что запись — задача или встреча.'}
+
+    def cancel_record(self, args):
+        rows = self.repo.search(self.con, self.owner, args.query, limit=10)
+        if not rows:
+            self.errors.append('Не нашёл активную запись по этому описанию. Уточните название встречи или задачи.')
+            return {'error': self.errors[-1]}
+        if len(rows) > 1:
+            self.questions.append('Нашёл несколько записей. Уточните дату или полное название той, которую нужно отменить.')
+            self.response_mode = 'clarification'
+            self.found.update({str(row['id']): row for row in rows})
+            self.read_count += 1
+            return {'needs_clarification': True, 'records': rows}
+        record = self.repo.cancel_record(self.con, self.owner, rows[0]['id'])
+        if not record:
+            self.errors.append('Запись уже отменена или недоступна.')
+            return {'error': self.errors[-1]}
+        self.cancelled.append(record)
+        return {'cancelled': record}
 
     def ask_clarification(self, args):
         self.questions.append(args.question)

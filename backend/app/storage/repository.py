@@ -36,10 +36,11 @@ class Repository:
     def create(con, owner, draft, source='chat', source_id=None, raw=None):
         fields = draft.model_dump()
         return con.execute('''INSERT INTO records
-            (id,owner_id,kind,text,scheduled_date,scheduled_time,timezone,source,source_id,raw_payload)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+            (id,owner_id,kind,text,scheduled_date,scheduled_time,duration_minutes,timezone,source,source_id,raw_payload)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
             (uuid4(), owner, fields['kind'], fields['text'], fields['scheduled_date'],
-             fields['scheduled_time'], fields['timezone'], source, source_id, Jsonb(raw or {}))).fetchone()
+             fields['scheduled_time'], fields['duration_minutes'], fields['timezone'],
+             source, source_id, Jsonb(raw or {}))).fetchone()
 
     @staticmethod
     def list_records(con, owner, first=None, last=None, kind=None, limit=100):
@@ -61,6 +62,20 @@ class Repository:
             ORDER BY ts_rank(to_tsvector('russian',text),plainto_tsquery('russian',%s)) DESC,
                 scheduled_date DESC NULLS LAST, id LIMIT %s''',
             (owner, kind, kind, query, query, query, limit)).fetchall()
+
+    @staticmethod
+    def meetings_between(con, owner, first, last):
+        return con.execute('''SELECT * FROM records
+            WHERE owner_id=%s AND kind='meeting' AND status <> 'cancelled'
+            AND scheduled_date BETWEEN %s AND %s AND scheduled_time IS NOT NULL
+            ORDER BY scheduled_date, scheduled_time, id''',
+            (owner, first, last)).fetchall()
+
+    @staticmethod
+    def cancel_record(con, owner, record_id):
+        return con.execute('''UPDATE records SET status='cancelled'
+            WHERE owner_id=%s AND id=%s AND status <> 'cancelled' RETURNING *''',
+            (owner, record_id)).fetchone()
 
     @staticmethod
     def history(con, owner, limit=20):

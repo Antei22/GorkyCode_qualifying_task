@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 from app.assistant.agent import Assistant
+from app.assistant.tools import CreateRecord, ListRecords, SearchRecords
 from app.config import Settings
 from app.domain.models import DomainError
 from app.domain.time import Clock
@@ -37,10 +38,11 @@ class FakeClient:
 class FakeTools:
     clock = Clock(fixed_now='2026-10-27T12:00:00+03:00')
     pending = None
-    questions = []
-
     def __init__(self):
         self.calls = []
+        self.questions = []
+        self.created = []
+        self.errors = []
 
     def encode(self, result):
         import json
@@ -52,6 +54,15 @@ class FakeTools:
 
 
 class AssistantTests(unittest.TestCase):
+    def test_russian_kind_aliases_are_normalized_for_all_tools(self):
+        self.assertEqual(CreateRecord.model_validate({'kind': 'встреча'}).kind, 'meeting')
+        self.assertEqual(CreateRecord.model_validate({'kind': 'задачу'}).kind, 'task')
+        self.assertEqual(CreateRecord.model_validate({'kind': 'напоминание'}).kind, 'reminder')
+        self.assertEqual(ListRecords.model_validate({'period': 'all',
+                                                     'kind': 'встречу'}).kind, 'meeting')
+        self.assertEqual(SearchRecords.model_validate({'query': 'Иван',
+                                                       'kind': 'задача'}).kind, 'task')
+
     def test_search_then_create_is_supported(self):
         client = FakeClient([Reply(tool_calls=[tool('search_records', '{"query":"Иван"}')]),
                              Reply(tool_calls=[tool('create_record', '{"kind":"reminder"}')]),
@@ -70,4 +81,43 @@ class AssistantTests(unittest.TestCase):
     def test_missing_credentials_fail_explicitly(self):
         with self.assertRaisesRegex(DomainError, 'LLM_API_KEY'):
             Assistant(Settings(llm_api_key='')).answer('Запрос', [], FakeTools())
+
+    def test_plain_text_without_tool_is_retried_and_clarification_stops_loop(self):
+        client = FakeClient([
+            Reply(content='Обычный ответ без инструмента'),
+            Reply(tool_calls=[tool('create_record', '{"kind":"meeting"}')]),
+            Reply(content='Во сколько назначить встречу?'),
+        ])
+        tools = FakeTools()
+
+        def call(name, args):
+            tools.calls.append((name, args))
+            tools.questions.append('На какое время?')
+            return {'needs_clarification': True, 'missing_field': 'time'}
+
+        tools.call = call
+        answer = Assistant(Settings(llm_api_key='test'),
+                           lambda **kwargs: client).answer('Создай встречу', [], tools)
+
+        self.assertEqual(answer, 'Во сколько назначить встречу?')
+        self.assertEqual([request['tool_choice'] for request in client.requests],
+                         ['auto', 'required', 'none'])
+        self.assertEqual(len(tools.calls), 1)
+
+    def test_successful_creation_does_not_request_model_again(self):
+        client = FakeClient([Reply(tool_calls=[tool(
+            'create_record', '{"kind":"task","text":"Купить билеты"}')])])
+        tools = FakeTools()
+
+        def call(name, args):
+            tools.calls.append((name, args))
+            tools.created.append({'kind': 'task', 'text': 'Купить билеты'})
+            return {'created': tools.created[0]}
+
+        tools.call = call
+        answer = Assistant(Settings(llm_api_key='test'),
+                           lambda **kwargs: client).answer('Купить билеты', [], tools)
+
+        self.assertEqual(answer, '')
+        self.assertEqual(len(client.requests), 1)
 

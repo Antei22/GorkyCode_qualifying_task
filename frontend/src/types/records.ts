@@ -6,6 +6,7 @@ export interface RecordItem {
   text: string;
   scheduled_date: string | null;
   scheduled_time: string | null;
+  duration_minutes: number | null;
   timezone: string;
   status: string;
   source: string;
