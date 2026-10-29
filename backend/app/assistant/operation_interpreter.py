@@ -9,9 +9,10 @@ from app.domain.duration import explicit_duration
 from app.domain.models import DomainError
 from app.domain.time import parse_day
 from app.domain.operations import (
-    Action, Interpretation, OperationField, OperationIntent, PendingOperation,
+    Action, CalendarScope, Interpretation, OperationField, OperationIntent, PendingOperation,
     Phase, RecordPatch, TargetQuery, TurnKind,
 )
+from app.observability import pipeline_event
 
 
 class Proposal(BaseModel):
@@ -57,6 +58,16 @@ class Proposal(BaseModel):
             'показать другое ближайшее время.'
         ),
     )
+    calendar_scope: CalendarScope | None = Field(
+        default=None,
+        description=(
+            'Режим поиска альтернативного времени: work_hours — будни 08:00–18:00; '
+            'weekdays_extended_hours — будни 08:00–22:00; all_days_work_hours — '
+            'любой день 08:00–18:00; extended_hours — любой день 08:00–22:00; '
+            'weekends_work_hours — выходные 08:00–18:00; '
+            'weekends_extended_hours — выходные 08:00–22:00.'
+        ),
+    )
     ambiguity_resolution: OperationField | None = Field(
         default=None,
         description=(
@@ -65,6 +76,15 @@ class Proposal(BaseModel):
         ),
     )
     selected_candidate_number: int | None = Field(default=None, ge=1, le=20)
+
+
+class ConfirmationProposal(BaseModel):
+    """Narrow model output while the server is waiting for plan confirmation."""
+    model_config = ConfigDict(extra='forbid')
+    decision: Literal[
+        'confirm', 'reject', 'alternative', 'new_operation', 'unclear',
+    ]
+    calendar_scope: CalendarScope | None = None
 
 
 class AuditFinding(BaseModel):
@@ -113,6 +133,15 @@ duration. Если expected_field=duration, та же числовая конс�
 другое время (например, «мне неудобно, какое ещё есть?», «покажи следующий вариант»),
 верни turn=continue, action=unknown и request_alternative=true. Это продолжение
 текущей операции, не read/update и не новая команда.
+Если expected_field=calendar_scope, выбери сочетание дней и часов:
+work_hours — будни 08:00–18:00; weekdays_extended_hours — будни 08:00–22:00;
+all_days_work_hours — любой день 08:00–18:00; extended_hours — любой день
+08:00–22:00; weekends_work_hours — только выходные 08:00–18:00;
+weekends_extended_hours — только выходные 08:00–22:00.
+Например, «в будни в любое время» — weekdays_extended_hours,
+«можно и в выходные, но только днём» — all_days_work_hours,
+«могу только в выходные» — weekends_work_hours. Это только настройка
+серверного поиска: не меняй поля записи и верни turn=continue, action=unknown.
 Если текущая операция содержит ambiguous_fields и пользователь выбирает одну из
 предложенных ролей (например, отвечает «длительность»), верни выбранное имя поля в
 ambiguity_resolution. Не проси его повторять исходное значение: оно хранится сервером.
@@ -135,6 +164,23 @@ disposition=explicit допустим только при единственно
 Если новых или неоднозначных значений нет, верни пустой findings.'''
 
 
+CONFIRMATION_INSTRUCTIONS = '''Определи только реакцию пользователя на предложенный
+сервером план. Ничего не выполняй и не разбирай поля записи.
+decision=confirm — пользователь принимает предложенный план;
+decision=reject — пользователь отказывается от текущего плана;
+decision=alternative — предложенное время не подходит и нужен другой вариант;
+decision=new_operation — пользователь начал отдельную самостоятельную команду;
+decision=unclear — смысл ответа не позволяет выбрать один вариант.
+Если пользователь отклоняет только предложенное время и одновременно уточняет,
+когда он доступен, это alternative, не reject. Заполни calendar_scope:
+work_hours — будни 08:00–18:00; weekdays_extended_hours — будни 08:00–22:00;
+all_days_work_hours — любой день 08:00–18:00; extended_hours — любой день 08:00–22:00;
+weekends_work_hours — только выходные 08:00–18:00;
+weekends_extended_hours — только выходные 08:00–22:00.
+Если меняются только дни, сохрани диапазон часов из текущей операции.
+Обязательно вызови resolve_confirmation.'''
+
+
 class LLMOperationInterpreter:
     def __init__(self, settings, client_factory=OpenAI):
         self.settings = settings
@@ -143,11 +189,23 @@ class LLMOperationInterpreter:
     def interpret(self, context, pending: PendingOperation | None) -> Interpretation:
         deterministic = self._turn(context.message, pending)
         if deterministic is not None:
+            pipeline_event(
+                'interpreter', 'deterministic_turn', context,
+                turn=deterministic.turn,
+                reason='short confirmation/rejection/abandonment matched by server',
+            )
             return deterministic
         if not self.settings.llm_api_key:
             raise DomainError(
                 'Для чата настройте LLM_API_KEY, LLM_BASE_URL и LLM_MODEL в .env.'
             )
+        if pending is not None and pending.phase == Phase.NEED_CONFIRMATION:
+            confirmation = self._interpret_confirmation(context, pending)
+            if confirmation is not None:
+                return confirmation
+            # resolve_confirmation classified this as an independent command.
+            # The full parser must not see or merge with the abandoned draft.
+            pending = None
         pending_context = self._pending_context(pending)
         history = '\n'.join(f'{role}: {content}' for role, content in context.history[-8:])
         messages = [
@@ -164,6 +222,11 @@ class LLMOperationInterpreter:
             'description': 'Предложить разбор одной пользовательской операции без выполнения.',
             'parameters': Proposal.model_json_schema(),
         }}
+        pipeline_event(
+            'llm', 'request_sent', context,
+            model=self.settings.llm_model, function='propose_operation',
+            pending_context=pending_context, history_messages=min(len(context.history), 8),
+        )
         with self.client_factory(
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key,
@@ -178,6 +241,13 @@ class LLMOperationInterpreter:
                 temperature=0,
             )
         calls = response.choices[0].message.tool_calls or []
+        pipeline_event(
+            'llm', 'response_received', context,
+            model=getattr(response, 'model', self.settings.llm_model),
+            finish_reason=getattr(response.choices[0], 'finish_reason', None),
+            tool_calls=[call.function.name for call in calls],
+            arguments=(calls[0].function.arguments if len(calls) == 1 else None),
+        )
         if len(calls) != 1 or calls[0].function.name != 'propose_operation':
             raise DomainError('Модель не смогла однозначно разобрать операцию.')
         try:
@@ -186,6 +256,10 @@ class LLMOperationInterpreter:
             raise DomainError('Модель вернула некорректный разбор операции.') from error
         proposal = self._normalize_action_fields(proposal, pending)
         proposal = self._normalize_pending_answer(context.message, pending, proposal)
+        pipeline_event(
+            'interpreter', 'proposal_normalized', context,
+            proposal=proposal,
+        )
         ambiguous_fields = ()
         ambiguity_values = {}
         ambiguity_evidence = None
@@ -267,6 +341,7 @@ class LLMOperationInterpreter:
                                 if pending is not None
                                 and proposal.ambiguity_resolution
                                 in pending.intent.ambiguous_fields else None),
+            calendar_scope=proposal.calendar_scope,
         )
         if proposal.request_alternative:
             intent_values['alternative_requested'] = True
@@ -280,8 +355,161 @@ class LLMOperationInterpreter:
             turn = TurnKind.NEW
         elif pending is not None and turn == TurnKind.UNKNOWN:
             turn = TurnKind.CONTINUE
-        return Interpretation(turn=turn, intent=intent,
-                              selected_candidate_id=selected)
+        interpretation = Interpretation(
+            turn=turn, intent=intent, selected_candidate_id=selected,
+        )
+        pipeline_event(
+            'interpreter', 'intent_ready', context,
+            turn=turn, intent=intent, selected_candidate_id=selected,
+        )
+        return interpretation
+
+    def _interpret_confirmation(self, context, pending):
+        """Classify a confirmation turn without exposing operation fields."""
+        pending_context = self._pending_context(pending)
+        history = '\n'.join(
+            f'{role}: {content}' for role, content in context.history[-8:]
+        )
+        messages = [
+            {'role': 'system', 'content': CONFIRMATION_INSTRUCTIONS},
+            {'role': 'user', 'content': (
+                f'Сейчас: {context.now.isoformat()}\n'
+                f'Текущая операция: {json.dumps(pending_context, ensure_ascii=False)}\n'
+                f'Недавний диалог:\n{history}\n'
+                f'Новая реплика: {context.message}'
+            )},
+        ]
+        function_name = 'resolve_confirmation'
+        specification = {'type': 'function', 'function': {
+            'name': function_name,
+            'description': 'Классифицировать ответ на предложенный сервером план.',
+            'parameters': ConfirmationProposal.model_json_schema(),
+        }}
+        pipeline_event(
+            'llm', 'request_sent', context,
+            model=self.settings.llm_model, function=function_name,
+            pending_context=pending_context,
+            history_messages=min(len(context.history), 8),
+        )
+        with self.client_factory(
+            base_url=self.settings.llm_base_url,
+            api_key=self.settings.llm_api_key,
+            timeout=self.settings.llm_timeout,
+            max_retries=0,
+        ) as client:
+            response = client.chat.completions.create(
+                model=self.settings.llm_model,
+                messages=messages,
+                tools=[specification],
+                tool_choice={
+                    'type': 'function', 'function': {'name': function_name},
+                },
+                temperature=0,
+            )
+        calls = response.choices[0].message.tool_calls or []
+        pipeline_event(
+            'llm', 'response_received', context,
+            model=getattr(response, 'model', self.settings.llm_model),
+            finish_reason=getattr(response.choices[0], 'finish_reason', None),
+            tool_calls=[call.function.name for call in calls],
+            arguments=(calls[0].function.arguments if len(calls) == 1 else None),
+        )
+        if len(calls) != 1 or calls[0].function.name != function_name:
+            raise DomainError('Модель не смогла однозначно разобрать подтверждение.')
+        try:
+            proposal = ConfirmationProposal.model_validate_json(
+                calls[0].function.arguments,
+            )
+        except (ValueError, TypeError, ValidationError) as error:
+            raise DomainError(
+                'Модель вернула некорректный разбор подтверждения.'
+            ) from error
+        pipeline_event(
+            'interpreter', 'confirmation_classified', context,
+            decision=proposal.decision, calendar_scope=proposal.calendar_scope,
+        )
+        explicit_scope = self._confirmation_calendar_scope(
+            context.message, pending.intent.calendar_scope,
+        )
+        if explicit_scope is not None:
+            proposal = proposal.model_copy(update={
+                'decision': 'alternative', 'calendar_scope': explicit_scope,
+            })
+        if proposal.decision == 'confirm':
+            return Interpretation(turn=TurnKind.CONFIRM)
+        if proposal.decision == 'reject':
+            return Interpretation(turn=TurnKind.REJECT)
+        if proposal.decision == 'alternative':
+            return Interpretation(
+                turn=TurnKind.CONTINUE,
+                intent=OperationIntent(
+                    alternative_requested=True,
+                    calendar_scope=proposal.calendar_scope,
+                ),
+            )
+        if proposal.decision == 'unclear':
+            # A no-op continuation makes policy repeat the current confirmation
+            # without discarding the server-owned pending plan.
+            return Interpretation(
+                turn=TurnKind.CONTINUE, intent=OperationIntent(),
+            )
+        # A genuine new command is parsed by the full operation schema below.
+        return None
+
+    @staticmethod
+    def _confirmation_calendar_scope(message, current_scope):
+        """Extract an explicit availability correction from a confirmation turn."""
+        value = message.lower().replace('ё', 'е')
+        mentions_weekends = bool(re.search(r'\bвыходн\w*\b', value))
+        mentions_weekdays = bool(re.search(r'\bбудн\w*\b', value))
+        weekends_only = bool(re.search(
+            r'только\s+(?:в\s+)?выходн\w*', value,
+        ))
+        weekdays_only = bool(re.search(
+            r'только\s+(?:по\s+|в\s+)?будн\w*', value,
+        ))
+        # During confirmation, a negative correction changes the selected set of
+        # days. It is different from «можно и в выходные», which broadens it.
+        correction = bool(re.search(r'\b(?:нет|передумал\w*)\b', value))
+        cannot_weekdays = bool(re.search(
+            r'не\s+могу[^.!?]*\bбудн\w*\b', value,
+        ))
+        cannot_weekends = bool(re.search(
+            r'не\s+могу[^.!?]*\bвыходн\w*\b', value,
+        ))
+        can_weekends = bool(re.search(
+            r'(?<!не\s)могу[^.!?]*\bвыходн\w*\b', value,
+        ))
+        can_weekdays = bool(re.search(
+            r'(?<!не\s)могу[^.!?]*\bбудн\w*\b', value,
+        ))
+        if (can_weekends and (cannot_weekdays or correction)
+                or correction and mentions_weekends and not mentions_weekdays):
+            weekends_only = True
+        if (can_weekdays and (cannot_weekends or correction)
+                or correction and mentions_weekdays and not mentions_weekends):
+            weekdays_only = True
+        if not weekends_only and not weekdays_only:
+            return None
+        explicitly_extended = bool(re.search(
+            r'(?:вечер|до\s*22|в любое время|не только рабоч)', value,
+        ))
+        explicitly_work = bool(re.search(
+            r'(?:рабочее время|до\s*18|только.*дн)', value,
+        ))
+        if explicitly_extended and not explicitly_work:
+            extended = True
+        elif explicitly_work and not explicitly_extended:
+            extended = False
+        else:
+            extended = current_scope in {
+                'weekdays_extended_hours', 'extended_hours',
+                'weekends_extended_hours',
+            }
+        if weekends_only:
+            return ('weekends_extended_hours' if extended
+                    else 'weekends_work_hours')
+        return ('weekdays_extended_hours' if extended else 'work_hours')
 
     @classmethod
     def _needs_audit(cls, message, proposal, pending):
@@ -347,6 +575,11 @@ class LLMOperationInterpreter:
             'description': 'Проверить пропущенные и неоднозначные поля без выполнения операции.',
             'parameters': AuditResult.model_json_schema(),
         }}
+        pipeline_event(
+            'llm_audit', 'request_sent', context,
+            model=self.settings.llm_model, function='audit_operation',
+            primary_proposal=proposal,
+        )
         with self.client_factory(
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key,
@@ -361,12 +594,23 @@ class LLMOperationInterpreter:
                 temperature=0,
             )
         calls = response.choices[0].message.tool_calls or []
+        pipeline_event(
+            'llm_audit', 'response_received', context,
+            model=getattr(response, 'model', self.settings.llm_model),
+            finish_reason=getattr(response.choices[0], 'finish_reason', None),
+            tool_calls=[call.function.name for call in calls],
+            arguments=(calls[0].function.arguments if len(calls) == 1 else None),
+        )
         if len(calls) != 1 or calls[0].function.name != 'audit_operation':
             return proposal, (), {}, None
         try:
             audit = AuditResult.model_validate_json(calls[0].function.arguments)
         except (ValueError, TypeError, ValidationError):
             return proposal, (), {}, None
+        pipeline_event(
+            'llm_audit', 'findings_validated', context,
+            findings=audit.findings,
+        )
         return self._apply_audit(context.message, pending, proposal, audit)
 
     @classmethod
@@ -495,6 +739,47 @@ class LLMOperationInterpreter:
     @staticmethod
     def _turn(message, pending):
         value = message.strip().lower().replace('ё', 'е').strip(' .,!')
+        if (pending is not None
+                and LLMOperationInterpreter._expected_field(pending) == 'calendar_scope'):
+            weekdays = bool(re.search(r'\bбудн\w*\b', value))
+            weekends = bool(re.search(r'\bвыходн\w*\b', value))
+            weekends_only = bool(re.search(
+                r'только\s+(?:в\s+)?выходн\w*', value,
+            ))
+            extended = bool(re.search(
+                r'(?:вечер|до\s*22|в любое время|не только рабоч|расшир)', value,
+            ))
+            work_only = bool(re.search(
+                r'(?:только.*рабоч|рабочее время|до\s*18|только.*дн)', value,
+            ))
+            if weekdays and extended:
+                return Interpretation(
+                    turn=TurnKind.CONTINUE,
+                    intent=OperationIntent(calendar_scope='weekdays_extended_hours'),
+                )
+            if weekends_only:
+                return Interpretation(
+                    turn=TurnKind.CONTINUE,
+                    intent=OperationIntent(
+                        calendar_scope=('weekends_work_hours' if work_only
+                                        else 'weekends_extended_hours'),
+                    ),
+                )
+            if weekends and work_only:
+                return Interpretation(
+                    turn=TurnKind.CONTINUE,
+                    intent=OperationIntent(calendar_scope='all_days_work_hours'),
+                )
+            if weekdays or work_only:
+                return Interpretation(
+                    turn=TurnKind.CONTINUE,
+                    intent=OperationIntent(calendar_scope='work_hours'),
+                )
+            if weekends or extended or re.search(r'^можно\b', value):
+                return Interpretation(
+                    turn=TurnKind.CONTINUE,
+                    intent=OperationIntent(calendar_scope='extended_hours'),
+                )
         if pending and value in {'да', 'подтверждаю', 'подтвердить', 'согласен',
                                  'согласна', 'подходит', 'ок', 'окей'}:
             return Interpretation(turn=TurnKind.CONFIRM)
@@ -523,6 +808,13 @@ class LLMOperationInterpreter:
         """
         candidates = cls._date_phrases(context.message)
         updates = {}
+        if len(candidates) == 1:
+            if (proposal.action == Action.CREATE
+                    and proposal.date_expression is None):
+                updates['date_expression'] = candidates[0]
+            elif (proposal.action in (Action.READ, Action.CANCEL)
+                    and proposal.target_date_expression is None):
+                updates['target_date_expression'] = candidates[0]
         for field in ('date_expression', 'target_date_expression'):
             expression = getattr(proposal, field)
             if expression is None:
@@ -531,7 +823,25 @@ class LLMOperationInterpreter:
                 parse_day(expression, context.now)
             except DomainError:
                 updates[field] = candidates[0] if len(candidates) == 1 else None
-        return proposal.model_copy(update=updates) if updates else proposal
+        verified = proposal.model_copy(update=updates) if updates else proposal
+        if verified.target_date_expression is not None:
+            try:
+                target_day = parse_day(
+                    verified.target_date_expression, context.now,
+                )
+            except DomainError:
+                target_day = None
+            if target_day is not None:
+                temporal = (
+                    'past' if target_day < context.now.date()
+                    else 'future' if target_day > context.now.date()
+                    else 'unspecified'
+                )
+                if verified.target_temporal != temporal:
+                    verified = verified.model_copy(update={
+                        'target_temporal': temporal,
+                    })
+        return verified
 
     @staticmethod
     def _date_phrases(message):
@@ -543,6 +853,8 @@ class LLMOperationInterpreter:
         patterns = (
             r'\b(?:послезавтра|сегодня|завтра|вчера)\b',
             r'\b\d{4}-\d{2}-\d{2}\b',
+            r'\b\d{1,2}\.\d{1,2}\.\d{4}\b',
+            r'\b\d{1,2}(?:-го)?\s+числа\b',
             rf'\b\d{{1,2}}\s+(?:{months})(?:\s+\d{{4}})?\b',
             rf'\b(?:в|во)?\s*(?:следующ(?:ий|ую|ее)\s+)?(?:{weekdays})\b',
             r'\b(?:до конца|в конце|конец)\s+(?:недели|месяца)\b',
@@ -562,6 +874,11 @@ class LLMOperationInterpreter:
         This is deliberately conservative: type-only and generic commands still
         reach policy as a missing text field and produce a clarification.
         """
+        # A short answer to a pending date/time/duration question is field data,
+        # never a replacement title.  The existing title is already stored in
+        # pending.intent and will be preserved by merge_intent.
+        if pending is not None and cls._expected_field(pending) != 'text':
+            return proposal
         creating = proposal.action == Action.CREATE or (
             pending is not None and pending.intent.action == Action.CREATE
         )
@@ -671,6 +988,9 @@ class LLMOperationInterpreter:
             return 'time_expression'
         if kind == 'meeting' and duration is None:
             return 'duration'
+        if (pending.proposed_plan is not None
+                and pending.intent.calendar_scope is None):
+            return 'calendar_scope'
         return None
 
     @classmethod
@@ -690,6 +1010,7 @@ class LLMOperationInterpreter:
                 'clear_fields': (('date', 'time')
                                  if selected_kind == 'reminder' else ()),
                 'read_fields': (), 'unknown_fields': (),
+                'calendar_scope': None,
                 'selected_candidate_number': None,
             })
         if (pending is not None and pending.intent.ambiguous_fields
@@ -705,6 +1026,7 @@ class LLMOperationInterpreter:
                 'time_expression': None, 'timezone': None,
                 'duration_minutes': None, 'duration_description': None,
                 'clear_fields': (), 'read_fields': (), 'unknown_fields': (),
+                'calendar_scope': None,
                 'selected_candidate_number': None,
             }
             if selected == 'duration' and stored:
@@ -732,7 +1054,26 @@ class LLMOperationInterpreter:
         expected = cls._expected_field(pending)
         if expected is None or cls._looks_like_new_command(message):
             return proposal
+        if expected == 'calendar_scope':
+            return proposal.model_copy(update={
+                'turn': TurnKind.CONTINUE, 'action': Action.UNKNOWN,
+                'target_query': None, 'target_kind': None,
+                'target_temporal': 'unspecified',
+                'target_date_expression': None, 'target_time_expression': None,
+                'kind': None, 'text': None, 'date_expression': None,
+                'time_expression': None, 'timezone': None,
+                'duration_minutes': None, 'duration_description': None,
+                'clear_fields': (), 'read_fields': (), 'unknown_fields': (),
+                'request_alternative': False,
+                'ambiguity_resolution': None,
+                'selected_candidate_number': None,
+            })
         updates = {'turn': TurnKind.CONTINUE, 'action': Action.UNKNOWN}
+        # Compact models sometimes copy a short clarification into `text`.
+        # Conversation state is authoritative: while another field is expected,
+        # such a value must not overwrite an already collected record title.
+        if expected != 'text':
+            updates['text'] = None
         # A number followed by "часа" is a duration in isolation, but it is an
         # appointment time when answering the explicit question "На какое время?".
         if expected == 'time_expression':

@@ -67,6 +67,7 @@ def merge_intent(previous: OperationIntent,
         ambiguity_evidence=ambiguity_evidence,
         # A request for another slot belongs only to the current turn.
         alternative_requested=current.alternative_requested,
+        calendar_scope=current.calendar_scope or previous.calendar_scope,
     )
 
 

@@ -130,6 +130,25 @@ class OperationStateTests(unittest.TestCase):
         self.assertIsNone(merged.changes.time_expression)
         self.assertEqual(merged.changes.model_fields_set, {'text', 'time_expression'})
 
+    def test_merge_preserves_selected_calendar_scope(self):
+        selected = merge_intent(
+            OperationIntent(action=Action.CREATE),
+            OperationIntent(calendar_scope='extended_hours'),
+        )
+        continued = merge_intent(selected, OperationIntent())
+        self.assertEqual(continued.calendar_scope, 'extended_hours')
+
+    def test_merge_replaces_selected_calendar_scope(self):
+        replaced = merge_intent(
+            OperationIntent(
+                action=Action.CREATE,
+                calendar_scope='weekdays_extended_hours',
+            ),
+            OperationIntent(calendar_scope='weekends_extended_hours'),
+        )
+
+        self.assertEqual(replaced.calendar_scope, 'weekends_extended_hours')
+
     def test_unknown_field_is_distinct_and_concrete_answer_supersedes_it(self):
         first = OperationIntent(
             action=Action.CREATE,

@@ -47,6 +47,7 @@ services:
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-45}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      PIPELINE_LOG_ENABLED: ${PIPELINE_LOG_ENABLED:-1}
     ports:
       - "127.0.0.1:8010:8000"
     depends_on:

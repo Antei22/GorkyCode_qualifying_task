@@ -15,9 +15,11 @@ from app.domain.time import Clock
 
 
 class FakeClient:
-    def __init__(self, arguments, audit_arguments=None):
+    def __init__(self, arguments, audit_arguments=None,
+                 confirmation_arguments=None):
         self.arguments = arguments
         self.audit_arguments = audit_arguments or {'findings': []}
+        self.confirmation_arguments = confirmation_arguments
         self.chat = SimpleNamespace(completions=self)
         self.requests = []
 
@@ -31,6 +33,9 @@ class FakeClient:
         self.requests.append(kwargs)
         name = kwargs['tools'][0]['function']['name']
         arguments = (self.audit_arguments if name == 'audit_operation'
+                     else self.confirmation_arguments
+                     if name == 'resolve_confirmation'
+                     and self.confirmation_arguments is not None
                      else self.arguments)
         call = SimpleNamespace(function=SimpleNamespace(
             name=name, arguments=json.dumps(arguments),
@@ -47,8 +52,9 @@ def context(message):
 
 
 class InterpreterTests(unittest.TestCase):
-    def interpreter(self, arguments, audit_arguments=None):
-        client = FakeClient(arguments, audit_arguments)
+    def interpreter(self, arguments, audit_arguments=None,
+                    confirmation_arguments=None):
+        client = FakeClient(arguments, audit_arguments, confirmation_arguments)
         adapter = LLMOperationInterpreter(
             Settings(llm_api_key='test'), lambda **kwargs: client,
         )
@@ -109,6 +115,123 @@ class InterpreterTests(unittest.TestCase):
         result = adapter.interpret(context('да'), pending)
         self.assertEqual(result.turn, TurnKind.CONFIRM)
 
+    def test_free_form_confirmation_uses_narrow_model_schema(self):
+        now = context('давай').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_CONFIRMATION,
+            intent=OperationIntent(action=Action.UPDATE),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, client = self.interpreter({'decision': 'confirm'})
+
+        result = adapter.interpret(context('давай'), pending)
+
+        self.assertEqual(result.turn, TurnKind.CONFIRM)
+        function = client.requests[0]['tools'][0]['function']
+        self.assertEqual(function['name'], 'resolve_confirmation')
+        self.assertEqual(
+            set(function['parameters']['properties']),
+            {'decision', 'calendar_scope'},
+        )
+
+    def test_availability_correction_is_not_treated_as_rejection(self):
+        now = context('нет, могу только в выходные').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_CONFIRMATION,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                changes={
+                    'kind': 'meeting', 'text': 'Встретиться с Алиной',
+                    'date_expression': '2026-10-30', 'time_expression': '08:00',
+                    'duration': {'minutes': 180},
+                },
+                calendar_scope='weekdays_extended_hours',
+            ),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, _ = self.interpreter({'decision': 'reject'})
+
+        result = adapter.interpret(
+            context(
+                'нет, я не могу по будням в любое время, '
+                'могу созвониться с ней только в выходные'
+            ),
+            pending,
+        )
+
+        self.assertEqual(result.turn, TurnKind.CONTINUE)
+        self.assertTrue(result.intent.alternative_requested)
+        self.assertEqual(
+            result.intent.calendar_scope, 'weekends_extended_hours',
+        )
+
+    def test_availability_correction_replaces_days_and_preserves_hours(self):
+        now = context('нет, могу в выходные').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_CONFIRMATION,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                changes={
+                    'kind': 'meeting', 'text': 'Встретиться с Алиной',
+                    'date_expression': '2026-10-30', 'time_expression': '08:00',
+                    'duration': {'minutes': 180},
+                },
+                calendar_scope='weekdays_extended_hours',
+            ),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, _ = self.interpreter({'decision': 'reject'})
+
+        result = adapter.interpret(context('нет, могу в выходные'), pending)
+
+        self.assertEqual(result.turn, TurnKind.CONTINUE)
+        self.assertTrue(result.intent.alternative_requested)
+        self.assertEqual(
+            result.intent.calendar_scope, 'weekends_extended_hours',
+        )
+
+    def test_new_command_during_confirmation_does_not_merge_with_draft(self):
+        now = context('Сколько длится встреча с дизайнером 30 числа?').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_CONFIRMATION,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                changes={
+                    'kind': 'meeting', 'text': 'Встреча с Настей',
+                    'date_expression': '2026-10-31', 'time_expression': '12:00',
+                    'duration': {'minutes': 40},
+                },
+            ),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, client = self.interpreter(
+            {
+                'turn': 'continue', 'action': 'read',
+                'target_query': 'встреча с дизайнером',
+                'target_date_expression': '30.10.2026',
+                'read_fields': ['duration'],
+            },
+            confirmation_arguments={'decision': 'new_operation'},
+        )
+
+        result = adapter.interpret(
+            context('Сколько длится встреча с дизайнером 30 числа?'), pending,
+        )
+
+        self.assertEqual(result.turn, TurnKind.NEW)
+        self.assertEqual(result.intent.action, Action.READ)
+        self.assertEqual(result.intent.target.query, 'встреча с дизайнером')
+        self.assertEqual(result.intent.target.date_expression, '30.10.2026')
+        self.assertEqual(result.intent.target.temporal, 'future')
+        self.assertEqual(
+            [request['tools'][0]['function']['name'] for request in client.requests],
+            ['resolve_confirmation', 'propose_operation'],
+        )
+
     def test_complete_action_without_pending_is_normalized_to_new(self):
         adapter, _ = self.interpreter({
             'turn': 'continue', 'action': 'update',
@@ -160,6 +283,35 @@ class InterpreterTests(unittest.TestCase):
         self.assertIsNone(second.intent.changes.date_expression)
         self.assertIn('date_expression', second.intent.changes.model_fields_set)
         self.assertEqual(second.intent.target.model_fields_set, set())
+
+    def test_kind_clarification_preserves_recovered_date_and_ignores_noise(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind_ambiguous': True,
+            'text': 'встретиться с Алиной',
+        })
+        first_context = context('Хочу завтра встретиться с Алиной')
+        first = adapter.interpret(first_context, None)
+
+        self.assertEqual(first.intent.changes.date_expression, 'завтра')
+        self.assertEqual(first.intent.ambiguous_fields, ('kind',))
+
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_FIELDS,
+            intent=first.intent, created_at=first_context.now,
+            updated_at=first_context.now,
+            expires_at=first_context.now + timedelta(minutes=30),
+        )
+        second_adapter, _ = self.interpreter({
+            'turn': 'continue', 'action': 'create',
+            'kind': 'meeting', 'ambiguity_resolution': 'kind',
+            'date_expression': 'завтра', 'duration_minutes': 180,
+            'calendar_scope': 'work_hours',
+        })
+        second = second_adapter.interpret(context('Буду встречаться'), pending)
+
+        self.assertEqual(second.intent.changes.kind, 'meeting')
+        self.assertNotIn('date_expression', second.intent.changes.model_fields_set)
+        self.assertIsNone(second.intent.calendar_scope)
 
     def test_unsupported_model_kind_becomes_missing_field(self):
         adapter, _ = self.interpreter({
@@ -521,6 +673,135 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(result.intent.changes.time_expression, '10:00')
         self.assertEqual(result.intent.unknown_fields, ())
 
+    def test_time_clarification_cannot_replace_existing_title(self):
+        now = context('в 11').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_FIELDS,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                changes={
+                    'kind': 'meeting', 'text': 'Встреча с дизайнером',
+                    'date_expression': 'завтра',
+                },
+            ),
+            proposed_plan=make_change_plan(
+                'create', None,
+                RecordSnapshot(
+                    id=uuid4(), kind='meeting', text='Встреча с дизайнером',
+                    scheduled_date=now.date() + timedelta(days=1),
+                    scheduled_time=None, timezone='Europe/Moscow',
+                    status='open', revision='new',
+                ),
+            ),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, _ = self.interpreter({
+            'turn': 'continue', 'action': 'unknown',
+            'time_expression': '11:00', 'text': 'в 11',
+        })
+
+        result = adapter.interpret(context('в 11'), pending)
+
+        self.assertEqual(result.intent.changes.time_expression, '11:00')
+        self.assertNotIn('text', result.intent.changes.model_fields_set)
+
+    def test_duration_clarification_cannot_replace_existing_title(self):
+        now = context('примерно 2 часа').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_FIELDS,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                changes={
+                    'kind': 'meeting', 'text': 'Встреча с дизайнером',
+                    'date_expression': 'завтра', 'time_expression': '11:00',
+                },
+            ),
+            proposed_plan=make_change_plan(
+                'create', None,
+                RecordSnapshot(
+                    id=uuid4(), kind='meeting', text='Встреча с дизайнером',
+                    scheduled_date=now.date() + timedelta(days=1),
+                    scheduled_time=now.time().replace(
+                        hour=11, minute=0, second=0, microsecond=0, tzinfo=None,
+                    ),
+                    timezone='Europe/Moscow', status='open', revision='new',
+                ),
+            ),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, _ = self.interpreter({
+            'turn': 'continue', 'action': 'unknown',
+            'duration_minutes': 120, 'text': 'примерно 2 часа',
+        })
+
+        result = adapter.interpret(context('примерно 2 часа'), pending)
+
+        self.assertEqual(result.intent.changes.duration.minutes, 120)
+        self.assertNotIn('text', result.intent.changes.model_fields_set)
+
+    def test_calendar_scope_answer_only_sets_search_window(self):
+        now = context('допустим более широкий диапазон').now
+        plan = make_change_plan(
+            'create', None,
+            RecordSnapshot(
+                id=uuid4(), kind='meeting', text='Встреча с дизайнером',
+                scheduled_date=now.date() + timedelta(days=1),
+                scheduled_time=now.time().replace(
+                    hour=15, minute=0, second=0, microsecond=0, tzinfo=None,
+                ),
+                duration={'minutes': 240, 'source': 'user'},
+                timezone='Europe/Moscow', status='open', revision='new',
+            ),
+        )
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_FIELDS,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                changes={
+                    'kind': 'meeting', 'text': 'Встреча с дизайнером',
+                    'date_expression': 'завтра', 'time_expression': '15:00',
+                    'duration': {'minutes': 240},
+                },
+            ),
+            proposed_plan=plan, created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, client = self.interpreter({
+            'turn': 'continue', 'action': 'update',
+            'calendar_scope': 'extended_hours',
+            'text': 'можно вечером и в выходные',
+            'date_expression': 'завтра',
+        })
+
+        result = adapter.interpret(
+            context('допустим более широкий диапазон'), pending,
+        )
+
+        self.assertEqual(result.turn, TurnKind.CONTINUE)
+        self.assertEqual(result.intent.action, Action.UNKNOWN)
+        self.assertEqual(result.intent.calendar_scope, 'extended_hours')
+        self.assertEqual(result.intent.changes.model_fields_set, set())
+        self.assertEqual(result.intent.target.model_fields_set, set())
+        schema = client.requests[0]['tools'][0]['function']['parameters']
+        self.assertIn('calendar_scope', schema['properties'])
+
+        deterministic = LLMOperationInterpreter(Settings(llm_api_key=''))
+        work = deterministic.interpret(context('только по будням'), pending)
+        extended = deterministic.interpret(
+            context('можно вечером и в выходные'), pending,
+        )
+        weekdays_extended = deterministic.interpret(
+            context('можно в будни в любое время'), pending,
+        )
+        self.assertEqual(work.intent.calendar_scope, 'work_hours')
+        self.assertEqual(extended.intent.calendar_scope, 'extended_hours')
+        self.assertEqual(
+            weekdays_extended.intent.calendar_scope,
+            'weekdays_extended_hours',
+        )
+
     def test_request_for_another_slot_continues_confirmation(self):
         now = context('Покажи другое время').now
         plan = make_change_plan(
@@ -549,11 +830,7 @@ class InterpreterTests(unittest.TestCase):
             proposed_plan=plan, created_at=now, updated_at=now,
             expires_at=now + timedelta(minutes=30),
         )
-        adapter, _ = self.interpreter({
-            'turn': 'new', 'action': 'read',
-            'target_query': 'свободное время',
-            'request_alternative': True,
-        })
+        adapter, client = self.interpreter({'decision': 'alternative'})
         result = adapter.interpret(
             context('Мне неудобно, какое ещё время есть?'), pending,
         )
@@ -562,6 +839,10 @@ class InterpreterTests(unittest.TestCase):
         self.assertTrue(result.intent.alternative_requested)
         self.assertEqual(result.intent.target.model_fields_set, set())
         self.assertEqual(result.intent.changes.model_fields_set, set())
+        self.assertEqual(
+            client.requests[0]['tools'][0]['function']['name'],
+            'resolve_confirmation',
+        )
 
 
 if __name__ == '__main__':

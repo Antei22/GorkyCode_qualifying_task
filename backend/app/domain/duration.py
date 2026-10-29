@@ -17,10 +17,16 @@ def explicit_duration(message):
     value = re.sub(r'\b(20|30|40|50)\s+([1-9])\b',
                    lambda m: str(int(m[1]) + int(m[2])), value)
     total = 0
-    for match in re.finditer(r'\b(\d+)\s*(минут\w*|час\w*)\b', value):
+    pattern = (
+        r'\b(?:(\d+)\s*(минут\w*|час\w*)|'
+        r'(минут\w*|час\w*)\s*(\d+))\b'
+    )
+    for match in re.finditer(pattern, value):
         if re.search(r'\bв\s*$', value[:match.start()]):
             continue
-        total += int(match[1]) * (60 if match[2].startswith('час') else 1)
+        number = int(match[1] or match[4])
+        unit = match[2] or match[3]
+        total += number * (60 if unit.startswith('час') else 1)
     if total:
         return total
     if re.fullmatch(r'(?:на\s+)?час', value.strip(' .!?')):

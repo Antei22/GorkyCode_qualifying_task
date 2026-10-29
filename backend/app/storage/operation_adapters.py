@@ -6,6 +6,7 @@ from app.domain.operations import (
     TargetResolution,
 )
 from app.domain.time import parse_day, parse_time
+from app.observability import pipeline_event
 
 
 def row_snapshot(row) -> RecordSnapshot:
@@ -30,17 +31,35 @@ class PostgresTargetResolver:
     def resolve(self, context: TurnContext, intent: OperationIntent,
                 selected_id=None) -> TargetResolution:
         if selected_id is not None:
+            pipeline_event(
+                'storage', 'record_lookup_started', context,
+                mode='selected_candidate', selected_id=selected_id,
+            )
             row = self.repository.get_record(
                 self.connection, context.owner_id, selected_id,
+            )
+            pipeline_event(
+                'storage', 'record_lookup_finished', context,
+                mode='selected_candidate', rows_found=1 if row else 0,
             )
             return TargetResolution(candidates=(row_snapshot(row),) if row else ())
         target = intent.target
         day = parse_day(target.date_expression, context.now) if target.date_expression else None
         moment = parse_time(target.time_expression) if target.time_expression else None
+        pipeline_event(
+            'storage', 'record_search_started', context,
+            query=target.query, kind=target.kind, temporal=target.temporal,
+            day=day, time=moment, limit=21,
+        )
         rows = self.repository.resolve_records(
             self.connection, context.owner_id, query=target.query,
             kind=target.kind, temporal=target.temporal, day=day, moment=moment,
             now=context.now, limit=21,
+        )
+        pipeline_event(
+            'storage', 'record_search_finished', context,
+            rows_found=len(rows), returned=min(len(rows), 20),
+            truncated=len(rows) > 20,
         )
         return TargetResolution(
             candidates=tuple(row_snapshot(row) for row in rows[:20]),
@@ -55,6 +74,12 @@ class PostgresOperationExecutor:
 
     def execute(self, context: TurnContext, plan) -> ExecutionResult:
         after = plan.after
+        pipeline_event(
+            'storage', 'mutation_started', context,
+            action=plan.action, record_id=after.id,
+            expected_revision=(plan.before.revision if plan.before else None),
+            fingerprint=plan.fingerprint,
+        )
         if plan.action in ('create', 'update'):
             draft = RecordDraft(
                 kind=after.kind, text=after.text,
@@ -83,4 +108,9 @@ class PostgresOperationExecutor:
             raise DomainError(
                 'Запись изменилась или стала недоступна. Повторите операцию заново.'
             )
+        pipeline_event(
+            'storage', 'mutation_finished', context,
+            action=plan.action, record_id=row['id'],
+            new_revision=str(row.get('version') or 1), status=row['status'],
+        )
         return ExecutionResult(action=plan.action, records=(row_snapshot(row),))

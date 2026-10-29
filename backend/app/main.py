@@ -16,6 +16,7 @@ from app.config import Settings
 from app.domain.models import DomainError, Kind
 from app.domain.time import Clock, period_bounds
 from app.ingestion.csv_import import import_csv
+from app.observability import configure_pipeline_logging, pipeline_event
 from app.service import Service
 from app.storage.repository import Repository
 
@@ -32,6 +33,7 @@ class ChatRequest(BaseModel):
 
 def create_app(settings=None, repository=None, assistant=None, operation_interpreter=None):
     settings = settings or Settings()
+    configure_pipeline_logging(settings.pipeline_logging)
     repo = repository or Repository(settings.database_url)
     clock = Clock(settings.timezone, settings.fixed_now)
     interpreter = operation_interpreter
@@ -101,7 +103,20 @@ def create_app(settings=None, repository=None, assistant=None, operation_interpr
 
     @app.post('/api/chat')
     def chat(payload: ChatRequest, request: Request, response: Response):
-        return service.chat(owner(request, response), payload.request_id, payload.message)
+        uid = owner(request, response)
+        pipeline_event(
+            'http', 'request_received',
+            request_id=str(payload.request_id), owner_id=str(uid),
+            method='POST', path='/api/chat', message=payload.message,
+        )
+        result = service.chat(uid, payload.request_id, payload.message)
+        pipeline_event(
+            'http', 'response_ready',
+            request_id=str(payload.request_id), owner_id=str(uid),
+            answer=result.get('answer', ''), has_pending=bool(result.get('pending')),
+            records_count=len(result.get('records', ())),
+        )
+        return result
 
     @app.get('/api/records')
     def records(request: Request, response: Response, period: str = 'all',

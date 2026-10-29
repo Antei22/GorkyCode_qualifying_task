@@ -14,6 +14,7 @@ from app.application.operations.ports import TurnContext
 from app.storage.operation_adapters import (
     PostgresOperationExecutor, PostgresTargetResolver,
 )
+from app.observability import pipeline_event
 
 
 class Service:
@@ -70,23 +71,47 @@ class Service:
         }
 
     def chat(self, owner, request_id, message):
-        if self.operation_interpreter is None:
-            return self._legacy_chat(owner, request_id, message)
-        # Let an already-started legacy draft finish through its original state
-        # machine. Every new operation uses the unified path.
-        with self.repo.connect() as con:
-            state = con.execute(
-                'SELECT pending,operation_state FROM sessions WHERE id=%s', (owner,)
-            ).fetchone()
-        if state and state['pending'] and not state['operation_state']:
-            return self._legacy_chat(owner, request_id, message)
-        return self._operation_chat(owner, request_id, message)
+        try:
+            if self.operation_interpreter is None:
+                pipeline_event(
+                    'service', 'route_selected', request_id=str(request_id),
+                    owner_id=str(owner), route='legacy', reason='unified_disabled',
+                )
+                return self._legacy_chat(owner, request_id, message)
+            # Let an already-started legacy draft finish through its original state
+            # machine. Every new operation uses the unified path.
+            with self.repo.connect() as con:
+                state = con.execute(
+                    'SELECT pending,operation_state FROM sessions WHERE id=%s', (owner,)
+                ).fetchone()
+            if state and state['pending'] and not state['operation_state']:
+                pipeline_event(
+                    'service', 'route_selected', request_id=str(request_id),
+                    owner_id=str(owner), route='legacy', reason='legacy_draft_exists',
+                )
+                return self._legacy_chat(owner, request_id, message)
+            pipeline_event(
+                'service', 'route_selected', request_id=str(request_id),
+                owner_id=str(owner), route='unified', reason='new_operation',
+            )
+            return self._operation_chat(owner, request_id, message)
+        except Exception as error:
+            pipeline_event(
+                'service', 'request_failed', request_id=str(request_id),
+                owner_id=str(owner), error_type=type(error).__name__,
+                error=str(error),
+            )
+            raise
 
     def _operation_chat(self, owner, request_id, message):
         with self.repo.connect() as con:
             session = con.execute(
                 'SELECT operation_state FROM sessions WHERE id=%s FOR UPDATE', (owner,)
             ).fetchone()
+            pipeline_event(
+                'transaction', 'session_locked', request_id=str(request_id),
+                owner_id=str(owner), lock='sessions FOR UPDATE',
+            )
             if not session:
                 raise DomainError('Сессия не найдена. Обновите страницу.')
             previous = con.execute(
@@ -96,6 +121,10 @@ class Service:
             if previous:
                 if previous['message'] != message:
                     raise DomainError('Этот request_id уже использован для другого сообщения.')
+                pipeline_event(
+                    'transaction', 'idempotent_replay', request_id=str(request_id),
+                    owner_id=str(owner), source='chat_requests',
+                )
                 return previous['response']
             pending = (load_pending(session['operation_state'])
                        if session['operation_state'] else None)
@@ -104,6 +133,12 @@ class Service:
                 owner_id=owner, request_id=request_id, message=message,
                 now=self.clock.now(),
                 history=tuple((row['role'], row['content']) for row in history_rows),
+            )
+            pipeline_event(
+                'service', 'context_built', context,
+                now=context.now, history_messages=len(context.history),
+                pending_phase=pending.phase if pending else None,
+                pending_operation_id=pending.operation_id if pending else None,
             )
             resolver = PostgresTargetResolver(self.repo, con)
             planner = DefaultChangePlanner()
@@ -114,12 +149,23 @@ class Service:
                 resolver=resolver, planner=planner, policy=policy, executor=executor,
             )
             outcome = coordinator.handle(context, pending)
+            pipeline_event(
+                'coordinator', 'outcome_received', context,
+                phase=outcome.phase, records_count=len(outcome.records),
+                issue_codes=[item.code for item in outcome.issues],
+                has_pending=outcome.pending is not None,
+                executed=outcome.execution is not None,
+            )
             state_payload = dump_pending(outcome.pending) if outcome.pending else None
             con.execute(
                 'UPDATE sessions SET operation_state=%s WHERE id=%s',
                 (Jsonb(state_payload) if state_payload else None, owner),
             )
             answer = self.operation_presenter.present(context, outcome)
+            pipeline_event(
+                'presenter', 'answer_rendered', context,
+                answer=answer,
+            )
             records = [self._snapshot_payload(item) for item in outcome.records]
             response = jsonable_encoder({
                 'answer': answer,
@@ -137,6 +183,12 @@ class Service:
                 'INSERT INTO chat_requests(owner_id,request_id,message,response) '
                 'VALUES (%s,%s,%s,%s)',
                 (owner, request_id, message, Jsonb(response)),
+            )
+            pipeline_event(
+                'transaction', 'changes_staged', context,
+                operation_state_saved=state_payload is not None,
+                history_saved=True, idempotency_saved=True,
+                note='commit occurs when the transaction context exits',
             )
             return response
 

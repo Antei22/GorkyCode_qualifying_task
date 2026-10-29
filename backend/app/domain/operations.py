@@ -17,6 +17,11 @@ from .models import Kind
 OperationField = Literal[
     'kind', 'text', 'date_expression', 'time_expression', 'timezone', 'duration',
 ]
+CalendarScope = Literal[
+    'work_hours', 'weekdays_extended_hours',
+    'all_days_work_hours', 'extended_hours',
+    'weekends_work_hours', 'weekends_extended_hours',
+]
 
 
 class Contract(BaseModel):
@@ -102,6 +107,9 @@ class OperationIntent(Contract):
     resolved_ambiguity: OperationField | None = None
     # Transient negotiation signal for a different proposed calendar slot.
     alternative_requested: bool = False
+    # User-selected bounds for server-proposed alternatives. Explicit times
+    # supplied by the user are not rejected merely for being outside the window.
+    calendar_scope: CalendarScope | None = None
 
 
 class Interpretation(Contract):

@@ -60,6 +60,29 @@ def parse_day(expression, now):
         return date.fromisoformat(value)
     except ValueError:
         pass
+    dotted = re.fullmatch(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', value)
+    if dotted:
+        try:
+            return date(int(dotted[3]), int(dotted[2]), int(dotted[1]))
+        except ValueError as error:
+            raise FieldInputError(
+                'date_expression', 'Такой календарной даты нет.'
+            ) from error
+    day_of_month = re.fullmatch(r'(\d{1,2})(?:-го)?\s+числа', value)
+    if day_of_month:
+        wanted = int(day_of_month[1])
+        year, month = now.year, now.month
+        for _ in range(12):
+            try:
+                result = date(year, month, wanted)
+            except ValueError:
+                result = None
+            if result is not None and result >= now.date():
+                return result
+            month += 1
+            if month == 13:
+                month, year = 1, year + 1
+        raise FieldInputError('date_expression', 'Такой календарной даты нет.')
     match = re.fullmatch(r'(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?', value)
     if match and match[2] in MONTHS:
         if match[3]:

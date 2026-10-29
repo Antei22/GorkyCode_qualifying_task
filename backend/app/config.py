@@ -17,4 +17,7 @@ class Settings:
     unified_operations: bool = field(
         default_factory=lambda: os.getenv('UNIFIED_OPERATIONS_ENABLED', '1') == '1'
     )
+    pipeline_logging: bool = field(
+        default_factory=lambda: os.getenv('PIPELINE_LOG_ENABLED', '1') == '1'
+    )
 

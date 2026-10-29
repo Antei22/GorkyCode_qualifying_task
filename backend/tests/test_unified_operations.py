@@ -40,6 +40,11 @@ class ScriptedInterpreter:
                 turn=TurnKind.CONTINUE,
                 intent=OperationIntent(alternative_requested=True),
             )
+        if message == 'только рабочее время':
+            return Interpretation(
+                turn=TurnKind.CONTINUE,
+                intent=OperationIntent(calendar_scope='work_hours'),
+            )
         if message == 'перенеси и переименуй встречу':
             return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
                 action=Action.UPDATE,
@@ -111,8 +116,10 @@ class UnifiedPostgresTests(unittest.TestCase):
 
     def test_conflict_proposes_and_confirms_nearest_free_time(self):
         self.chat('создай первую встречу')
-        proposed = self.chat('создай конфликтующую встречу')
+        scope = self.chat('создай конфликтующую встречу')
+        self.assertIn('только по будням', scope['answer'])
 
+        proposed = self.chat('только рабочее время')
         self.assertIn('Ближайшее свободное время', proposed['answer'])
         self.assertTrue(proposed['pending'])
         self.assertEqual(len(self.rows()), 1)
@@ -120,21 +127,22 @@ class UnifiedPostgresTests(unittest.TestCase):
         completed = self.chat('подтверждаю')
         self.assertIsNone(completed['pending'])
         rows = {row['text']: row for row in self.rows()}
-        self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(12))
+        self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(8))
 
     def test_conflict_can_offer_the_next_alternative(self):
         self.chat('создай первую встречу')
-        first = self.chat('создай конфликтующую встречу')
-        self.assertIn('12:00', first['answer'])
+        self.chat('создай конфликтующую встречу')
+        first = self.chat('только рабочее время')
+        self.assertIn('08:00', first['answer'])
 
         second = self.chat('покажи другое время')
         self.assertIn('Следующее свободное время', second['answer'])
-        self.assertIn('12:30', second['answer'])
+        self.assertIn('08:30', second['answer'])
         self.assertEqual(len(self.rows()), 1)
 
         completed = self.chat('да')
         rows = {row['text']: row for row in self.rows()}
-        self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(12, 30))
+        self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(8, 30))
 
     def test_read_has_no_write_and_cancel_needs_confirmation(self):
         self.chat('создай первую встречу')

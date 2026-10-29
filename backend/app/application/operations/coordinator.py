@@ -5,6 +5,7 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 from app.domain.models import FieldInputError
+from app.observability import pipeline_event
 
 from app.domain.operations import (
     Action, OperationIntent, OperationOutcome, PendingOperation, Phase,
@@ -36,6 +37,13 @@ class OperationCoordinator:
         """
         interpretation = self.interpreter.interpret(context, pending)
         turn = interpretation.turn
+        pipeline_event(
+            'coordinator', 'interpretation_received', context,
+            turn=turn,
+            proposed_action=(interpretation.intent.action
+                             if interpretation.intent else None),
+            selected_candidate_id=interpretation.selected_candidate_id,
+        )
 
         if turn in (TurnKind.ABANDON, TurnKind.REJECT):
             return OperationOutcome(
@@ -78,9 +86,14 @@ class OperationCoordinator:
         else:
             intent = interpretation.intent or OperationIntent()
             pending = None
+        pipeline_event(
+            'coordinator', 'intent_selected', context,
+            continuing=continuing, action=intent.action, intent=intent,
+        )
 
         if intent.action == Action.UNKNOWN:
             decision = self.policy.evaluate(context, intent, None, pending)
+            self._log_decision(context, decision, plan=None)
             return self._from_decision(context, intent, decision, pending)
 
         selected_id = interpretation.selected_candidate_id
@@ -118,6 +131,13 @@ class OperationCoordinator:
             try:
                 resolution = self.resolver.resolve(
                     context, intent, selected_id=selected_id,
+                )
+                pipeline_event(
+                    'resolver', 'target_resolved', context,
+                    selected_candidate_id=selected_id,
+                    candidates_count=len(resolution.candidates),
+                    candidate_ids=[item.id for item in resolution.candidates],
+                    truncated=resolution.truncated,
                 )
             except FieldInputError as error:
                 intent = self._without_invalid_field(intent, error.field, target=True)
@@ -157,6 +177,7 @@ class OperationCoordinator:
 
         if intent.action == Action.READ:
             decision = self.policy.evaluate(context, intent, None, pending)
+            self._log_decision(context, decision, plan=None)
             if decision.phase == Phase.READY:
                 return OperationOutcome(phase=Phase.COMPLETED,
                                         records=resolution.candidates,
@@ -170,6 +191,11 @@ class OperationCoordinator:
         try:
             plan = self.planner.prepare(
                 context, intent, target, previous_plan=previous_plan,
+            )
+            pipeline_event(
+                'planner', 'plan_prepared', context,
+                action=plan.action, fingerprint=plan.fingerprint,
+                before=plan.before, after=plan.after,
             )
         except FieldInputError as error:
             intent = self._without_invalid_field(intent, error.field, target=False)
@@ -202,6 +228,7 @@ class OperationCoordinator:
                 })
 
         decision = self.policy.evaluate(context, intent, plan, policy_pending)
+        self._log_decision(context, decision, plan)
         if plan_changed and decision.phase in (Phase.READY, Phase.NEED_CONFIRMATION):
             issue = ValidationIssue(
                 code='plan_changed',
@@ -225,6 +252,12 @@ class OperationCoordinator:
             )
 
         execution = self.executor.execute(context, plan)
+        pipeline_event(
+            'executor', 'execution_returned', context,
+            action=execution.action,
+            record_ids=[item.id for item in execution.records],
+            revisions=[item.revision for item in execution.records],
+        )
         if execution.action != plan.action:
             raise RuntimeError('operation executor returned a different action')
         if len(execution.records) != 1 or execution.records[0].id != plan.after.id:
@@ -237,6 +270,18 @@ class OperationCoordinator:
             phase=Phase.COMPLETED,
             records=execution.records,
             execution=execution,
+        )
+
+    @staticmethod
+    def _log_decision(context, decision, plan):
+        pipeline_event(
+            'policy', 'decision_made', context,
+            phase=decision.phase,
+            missing_fields=decision.missing_fields,
+            issue_codes=[item.code for item in decision.issues],
+            question=decision.question,
+            plan_fingerprint=plan.fingerprint if plan else None,
+            alternative_plan=decision.alternative_plan is not None,
         )
 
     def _from_decision(self, context, intent, decision, previous,

@@ -6,7 +6,7 @@ from unittest.mock import Mock
 from uuid import uuid4
 
 from app.assistant.tools import Tools
-from app.domain.duration import duration_request
+from app.domain.duration import duration_request, explicit_duration
 from app.domain.models import RecordDraft
 from app.domain.time import Clock
 from app.service import Service
@@ -14,6 +14,11 @@ from app.storage.repository import Repository
 
 
 class DurationIntentTests(unittest.TestCase):
+    def test_duration_accepts_number_before_or_after_unit(self):
+        for message in ('3 часа', 'часа 3', 'три часа', 'часа три'):
+            with self.subTest(message=message):
+                self.assertEqual(explicit_duration(message), 180)
+
     def test_change_and_question_never_authorize_cancellation(self):
         repo, con = Mock(), Mock()
         for message in ('Исправь что встреча с марией будет длится долго',

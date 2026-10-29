@@ -17,6 +17,10 @@ class TimeTests(unittest.TestCase):
         self.assertEqual(parse_day('в пятницу', self.now), date(2026, 10, 30))
         self.assertEqual(parse_day('до конца недели', self.now), date(2026, 11, 1))
 
+    def test_numeric_and_day_of_month_dates(self):
+        self.assertEqual(parse_day('30.10.2026', self.now), date(2026, 10, 30))
+        self.assertEqual(parse_day('30 числа', self.now), date(2026, 10, 30))
+
     def test_next_weekday_and_end_of_month(self):
         self.assertEqual(parse_day('в следующую пятницу', self.now), date(2026, 11, 6))
         self.assertEqual(parse_day('в конце месяца', self.now), date(2026, 10, 31))
