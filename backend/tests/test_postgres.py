@@ -23,7 +23,7 @@ class ScriptedAssistant:
             tools.call('create_record', {'mode': 'continue', 'time_expression': '11:00'})
         elif message == 'без времени':
             tools.call('create_record', {'mode': 'start', 'kind': 'meeting', 'text': 'Иван',
-                                         'date_expression': 'завтра'})
+                                         'date_expression': 'завтра', 'duration_minutes': 60})
         else:
             tools.call('create_record', {'mode': 'start', 'kind': 'task', 'text': message,
                                          'date_expression': 'в пятницу'})
@@ -66,12 +66,13 @@ class MultiStepAssistant:
         },
         'встреча с дизайнером': {
             'mode': 'start', 'kind': 'meeting', 'text': 'Встреча с дизайнером',
-            'date_expression': 'завтра', 'time_expression': '11:00',
+            'date_expression': 'завтра', 'time_expression': '11:00', 'duration_minutes': 60,
         },
         'созвониться с Катей': {
             'mode': 'start', 'kind': 'meeting', 'text': 'Созвониться с Катей',
-            'date_expression': 'завтра', 'time_expression': '11:00',
+            'date_expression': 'завтра', 'time_expression': '11:00', 'duration_minutes': 30,
         },
+        'час': {'mode': 'continue', 'duration_minutes': 60},
         'в 12': {'mode': 'continue', 'time_expression': '12:00'},
     }
 
@@ -150,6 +151,9 @@ class PostgresTests(unittest.TestCase):
         self.assertEqual(first['answer'], 'Что создать: задачу, встречу или напоминание?')
         self.assertEqual(second['answer'], 'На какую дату?')
         self.assertEqual(third['answer'], 'На какое время?')
+        self.assertEqual(result['answer'], 'Сколько будет длиться встреча?')
+        self.assertEqual(len(self.rows()), 0)
+        result = service.chat(self.owners[0], uuid4(), 'час')
         self.assertIn('Встреча сохранена', result['answer'])
         self.assertEqual(self.rows()[0]['text'], 'Созвон с Иваном')
 
@@ -219,7 +223,7 @@ class PostgresTests(unittest.TestCase):
         self.assertEqual(
             conflict['answer'],
             'На 28.10.2026 в 11:00 уже запланирована встреча '
-            '«Встреча с дизайнером». Укажите другое время.',
+            '«Встреча с дизайнером». Ближайшее свободное время — 28.10.2026 в 12:00. Подтвердить?',
         )
         self.assertEqual(conflict['pending']['text'], 'Созвониться с Катей')
         self.assertEqual(conflict['pending']['time_expression'], '11:00')

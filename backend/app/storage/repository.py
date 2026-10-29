@@ -1,5 +1,6 @@
 """PostgreSQL repository for sessions, records and chat history."""
 from pathlib import Path
+from datetime import datetime
 from uuid import uuid4
 import psycopg
 from psycopg.rows import dict_row
@@ -36,32 +37,139 @@ class Repository:
     def create(con, owner, draft, source='chat', source_id=None, raw=None):
         fields = draft.model_dump()
         return con.execute('''INSERT INTO records
-            (id,owner_id,kind,text,scheduled_date,scheduled_time,duration_minutes,timezone,source,source_id,raw_payload)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+            (id,owner_id,kind,text,scheduled_date,scheduled_time,duration_minutes,duration_source,duration_description,timezone,source,source_id,raw_payload)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
             (uuid4(), owner, fields['kind'], fields['text'], fields['scheduled_date'],
-             fields['scheduled_time'], fields['duration_minutes'], fields['timezone'],
+             fields['scheduled_time'], fields['duration_minutes'], fields['duration_source'],
+             fields['duration_description'], fields['timezone'],
              source, source_id, Jsonb(raw or {}))).fetchone()
 
     @staticmethod
-    def list_records(con, owner, first=None, last=None, kind=None, limit=100):
+    def create_with_id(con, owner, record_id, draft, source='chat'):
+        fields = draft.model_dump()
+        return con.execute('''INSERT INTO records
+            (id,owner_id,kind,text,scheduled_date,scheduled_time,duration_minutes,
+             duration_source,duration_description,timezone,source,raw_payload)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+            RETURNING *''',
+            (record_id, owner, fields['kind'], fields['text'],
+             fields['scheduled_date'], fields['scheduled_time'],
+             fields['duration_minutes'], fields['duration_source'],
+             fields['duration_description'], fields['timezone'], source)).fetchone()
+
+    @staticmethod
+    def get_record(con, owner, record_id):
+        return con.execute('''SELECT * FROM records
+            WHERE owner_id=%s AND id=%s AND status <> 'cancelled' ''',
+            (owner, record_id)).fetchone()
+
+    @staticmethod
+    def resolve_records(con, owner, query=None, kind=None, temporal='unspecified',
+                        day=None, moment=None, now=None, limit=20):
+        now = (now or datetime.now()).replace(tzinfo=None)
+        query = (query or '').strip() or None
+        return con.execute('''SELECT * FROM records
+            WHERE owner_id=%s AND status <> 'cancelled'
+            AND (%s::text IS NULL OR kind=%s)
+            AND (%s::text IS NULL OR
+                 to_tsvector('russian',text) @@ plainto_tsquery('russian',%s)
+                 OR strpos(lower(text),lower(%s)) > 0)
+            AND (%s::date IS NULL OR scheduled_date=%s)
+            AND (%s::time IS NULL OR scheduled_time=%s)
+            AND (%s IN ('unspecified','all')
+                 OR (%s='future' AND (scheduled_date IS NULL OR
+                     scheduled_date + COALESCE(scheduled_time,time '23:59:59') >= %s))
+                 OR (%s='past' AND scheduled_date IS NOT NULL AND
+                     scheduled_date + COALESCE(scheduled_time,time '23:59:59') < %s))
+            ORDER BY
+                CASE WHEN scheduled_date + COALESCE(scheduled_time,time '23:59:59') >= %s THEN 0
+                     WHEN scheduled_date IS NULL THEN 1 ELSE 2 END,
+                CASE WHEN scheduled_date + COALESCE(scheduled_time,time '23:59:59') >= %s
+                     THEN scheduled_date END ASC,
+                CASE WHEN scheduled_date + COALESCE(scheduled_time,time '23:59:59') >= %s
+                     THEN scheduled_time END ASC NULLS LAST,
+                scheduled_date DESC NULLS LAST, scheduled_time DESC NULLS LAST, id
+            LIMIT %s''',
+            (owner, kind, kind, query, query, query, day, day, moment, moment,
+             temporal, temporal, now, temporal, now, now, now, now, limit)).fetchall()
+
+    @staticmethod
+    def update_record(con, owner, record_id, expected_version, draft):
+        fields = draft.model_dump()
+        return con.execute('''UPDATE records SET kind=%s, text=%s,
+            scheduled_date=%s, scheduled_time=%s, duration_minutes=%s,
+            duration_source=%s, duration_description=%s, timezone=%s,
+            version=version+1, updated_at=now()
+            WHERE owner_id=%s AND id=%s AND version=%s AND status='open'
+            RETURNING *''',
+            (fields['kind'], fields['text'], fields['scheduled_date'],
+             fields['scheduled_time'], fields['duration_minutes'],
+             fields['duration_source'], fields['duration_description'],
+             fields['timezone'], owner, record_id, expected_version)).fetchone()
+
+    @staticmethod
+    def cancel_record_versioned(con, owner, record_id, expected_version, now):
+        local_now = now.replace(tzinfo=None)
+        return con.execute('''UPDATE records SET status='cancelled',
+            version=version+1, updated_at=now()
+            WHERE owner_id=%s AND id=%s AND version=%s AND status='open'
+            AND (scheduled_date IS NULL OR
+                 scheduled_date + COALESCE(scheduled_time,time '23:59:59') >= %s)
+            RETURNING *''',
+            (owner, record_id, expected_version, local_now)).fetchone()
+
+    @staticmethod
+    def list_records(con, owner, first=None, last=None, kind=None, limit=100, now=None):
+        now = now or datetime.now()
+        today, current_time = now.date(), now.time().replace(tzinfo=None)
         return con.execute('''SELECT * FROM records WHERE owner_id=%s AND status <> 'cancelled'
             AND (%s::date IS NULL OR scheduled_date >= %s)
             AND (%s::date IS NULL OR scheduled_date <= %s)
             AND (%s::text IS NULL OR kind=%s)
-            ORDER BY scheduled_date NULLS LAST, scheduled_time NULLS LAST, id LIMIT %s''',
-            (owner, first, first, last, last, kind, kind, limit)).fetchall()
+            ORDER BY
+                CASE
+                    WHEN scheduled_date > %s OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)) THEN 0
+                    WHEN scheduled_date IS NULL THEN 1
+                    ELSE 2
+                END,
+                CASE WHEN scheduled_date > %s OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)) THEN scheduled_date END ASC,
+                CASE WHEN scheduled_date > %s OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)) THEN scheduled_time END ASC NULLS LAST,
+                CASE WHEN scheduled_date < %s OR (scheduled_date=%s AND scheduled_time < %s) THEN scheduled_date END DESC,
+                CASE WHEN scheduled_date < %s OR (scheduled_date=%s AND scheduled_time < %s) THEN scheduled_time END DESC NULLS LAST,
+                id LIMIT %s''',
+            (owner, first, first, last, last, kind, kind,
+             today, today, current_time, today, today, current_time,
+             today, today, current_time, today, today, current_time,
+             today, today, current_time, limit)).fetchall()
 
     @staticmethod
-    def search(con, owner, query, kind=None, limit=20):
+    def search(con, owner, query, kind=None, limit=20, now=None, future_only=False):
         # FTS handles Russian inflections; substring fallback handles name fragments.
         query = query.strip()
+        now = now or datetime.now()
+        today, current_time = now.date(), now.time().replace(tzinfo=None)
         return con.execute('''SELECT * FROM records WHERE owner_id=%s AND status <> 'cancelled'
             AND (%s::text IS NULL OR kind=%s)
+            AND (NOT %s OR scheduled_date IS NULL OR scheduled_date > %s
+                 OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)))
             AND (to_tsvector('russian',text) @@ plainto_tsquery('russian',%s)
                  OR strpos(lower(text),lower(%s)) > 0)
-            ORDER BY ts_rank(to_tsvector('russian',text),plainto_tsquery('russian',%s)) DESC,
-                scheduled_date DESC NULLS LAST, id LIMIT %s''',
-            (owner, kind, kind, query, query, query, limit)).fetchall()
+            ORDER BY
+                CASE
+                    WHEN scheduled_date > %s OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)) THEN 0
+                    WHEN scheduled_date IS NULL THEN 1
+                    ELSE 2
+                END,
+                CASE WHEN scheduled_date > %s OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)) THEN scheduled_date END ASC,
+                CASE WHEN scheduled_date > %s OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)) THEN scheduled_time END ASC NULLS LAST,
+                ts_rank(to_tsvector('russian',text),plainto_tsquery('russian',%s)) DESC,
+                CASE WHEN scheduled_date < %s OR (scheduled_date=%s AND scheduled_time < %s) THEN scheduled_date END DESC,
+                CASE WHEN scheduled_date < %s OR (scheduled_date=%s AND scheduled_time < %s) THEN scheduled_time END DESC NULLS LAST,
+                id LIMIT %s''',
+            (owner, kind, kind, future_only, today, today, current_time,
+             query, query, today, today, current_time, today, today, current_time,
+             today, today, current_time, query, today, today, current_time,
+             today, today, current_time, limit)).fetchall()
 
     @staticmethod
     def meetings_between(con, owner, first, last):
@@ -72,10 +180,43 @@ class Repository:
             (owner, first, last)).fetchall()
 
     @staticmethod
-    def cancel_record(con, owner, record_id):
+    def duration_candidates(con, owner, query, now, temporal='future', day=None):
+        # Untyped imports remain untyped; only meeting-shaped titles are candidates.
+        local_now = now.replace(tzinfo=None)
+        return con.execute('''SELECT * FROM records
+            WHERE owner_id=%s AND status <> 'cancelled'
+            AND (kind='meeting' OR (kind IS NULL AND text ~* '^(встреча|созвон)([[:space:]]|$)'))
+            AND (to_tsvector('russian',text) @@ plainto_tsquery('russian',%s)
+                 OR strpos(lower(text),lower(%s)) > 0)
+            AND (%s::date IS NULL OR scheduled_date=%s)
+            AND (%s='all' OR (%s='future' AND scheduled_date + COALESCE(scheduled_time, time '23:59:59') >= %s)
+                 OR (%s='past' AND scheduled_date + COALESCE(scheduled_time, time '23:59:59') < %s))
+            ORDER BY
+                CASE WHEN %s='past' THEN scheduled_date END DESC,
+                CASE WHEN %s='past' THEN scheduled_time END DESC,
+                scheduled_date, scheduled_time, id LIMIT 20''',
+            (owner, query, query, day, day, temporal, temporal, local_now,
+             temporal, local_now, temporal, temporal)).fetchall()
+
+    @staticmethod
+    def update_duration(con, owner, record_id, minutes, source, description, now):
+        return con.execute('''UPDATE records SET duration_minutes=%s,
+            duration_source=%s, duration_description=%s, updated_at=now()
+            WHERE owner_id=%s AND id=%s AND kind='meeting' AND status <> 'cancelled'
+            AND scheduled_date + COALESCE(scheduled_time, time '23:59:59') >= %s
+            RETURNING *''', (minutes, source, description, owner, record_id,
+                             now.replace(tzinfo=None))).fetchone()
+
+    @staticmethod
+    def cancel_record(con, owner, record_id, now=None):
+        now = now or datetime.now()
+        today, current_time = now.date(), now.time().replace(tzinfo=None)
         return con.execute('''UPDATE records SET status='cancelled'
-            WHERE owner_id=%s AND id=%s AND status <> 'cancelled' RETURNING *''',
-            (owner, record_id)).fetchone()
+            WHERE owner_id=%s AND id=%s AND status <> 'cancelled'
+            AND (scheduled_date IS NULL OR scheduled_date > %s
+                 OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)))
+            RETURNING *''',
+            (owner, record_id, today, today, current_time)).fetchone()
 
     @staticmethod
     def history(con, owner, limit=20):

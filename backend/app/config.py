@@ -14,4 +14,7 @@ class Settings:
     llm_timeout: float = field(default_factory=lambda: float(os.getenv('LLM_TIMEOUT_SECONDS', '45')))
     frontend_origin: str = field(default_factory=lambda: os.getenv('FRONTEND_ORIGIN', 'http://localhost:5174'))
     cookie_secure: bool = field(default_factory=lambda: os.getenv('COOKIE_SECURE', '0') == '1')
+    unified_operations: bool = field(
+        default_factory=lambda: os.getenv('UNIFIED_OPERATIONS_ENABLED', '1') == '1'
+    )
 

@@ -6,7 +6,7 @@ import re
 from calendar import monthrange
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
-from .models import DomainError
+from .models import DomainError, FieldInputError
 
 WEEKDAYS = {'понедельник': 0, 'вторник': 1, 'среду': 2, 'среда': 2,
             'четверг': 3, 'пятницу': 4, 'пятница': 4, 'субботу': 5,
@@ -48,7 +48,7 @@ def parse_day(expression, now):
     if value in ('до конца месяца', 'конец месяца', 'в конце месяца'):
         return date(now.year, now.month, monthrange(now.year, now.month)[1])
     if value in ('на следующей неделе', 'следующая неделя'):
-        raise DomainError('Какой день следующей недели выбрать?')
+        raise FieldInputError('date_expression', 'Какой день следующей недели выбрать?')
     next_weekday = re.fullmatch(r'(?:в|во)?\s*следующ(?:ий|ую|ее)\s+([а-я]+)', value)
     if next_weekday and next_weekday[1] in WEEKDAYS:
         next_monday = now.date() + timedelta(days=7 - now.weekday())
@@ -66,7 +66,7 @@ def parse_day(expression, now):
             try:
                 return date(int(match[3]), MONTHS[match[2]], int(match[1]))
             except ValueError as error:
-                raise DomainError('Такой календарной даты нет.') from error
+                raise FieldInputError('date_expression', 'Такой календарной даты нет.') from error
         for year in range(now.year, now.year + 9):
             try:
                 result = date(year, MONTHS[match[2]], int(match[1]))
@@ -74,8 +74,11 @@ def parse_day(expression, now):
                 continue
             if result >= now.date():
                 return result
-        raise DomainError('Такой календарной даты нет.')
-    raise DomainError('Уточните дату: например, «завтра», «в пятницу» или YYYY-MM-DD.')
+        raise FieldInputError('date_expression', 'Такой календарной даты нет.')
+    raise FieldInputError(
+        'date_expression',
+        'Уточните дату: например, «завтра», «в пятницу» или YYYY-MM-DD.',
+    )
 
 
 def parse_time(expression):
@@ -87,7 +90,9 @@ def parse_time(expression):
         value = re.sub(rf'\b{word}\b', str(number), value)
     match = re.fullmatch(r'(\d{1,2})(?::(\d{2}))?(?:\s*(утра|вечера|дня|ночи))?', value)
     if not match:
-        raise DomainError('Уточните время, например 10:00 или «в 3 дня».')
+        raise FieldInputError(
+            'time_expression', 'Уточните время, например 10:00 или «в 3 дня».'
+        )
     hour, minute = int(match[1]), int(match[2] or 0)
     if match[3] in ('вечера', 'дня') and 1 <= hour <= 11:
         hour += 12
@@ -96,7 +101,9 @@ def parse_time(expression):
     try:
         return time(hour, minute)
     except ValueError as error:
-        raise DomainError('Время должно быть от 00:00 до 23:59.') from error
+        raise FieldInputError(
+            'time_expression', 'Время должно быть от 00:00 до 23:59.'
+        ) from error
 
 
 def schedule(day_expression, time_expression, now):

@@ -11,6 +11,7 @@ from openai import OpenAIError
 from psycopg import Error as DatabaseError
 from pydantic import BaseModel, ConfigDict, Field
 from app.assistant.agent import Assistant
+from app.assistant.operation_interpreter import LLMOperationInterpreter
 from app.config import Settings
 from app.domain.models import DomainError, Kind
 from app.domain.time import Clock, period_bounds
@@ -29,11 +30,15 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
 
 
-def create_app(settings=None, repository=None, assistant=None):
+def create_app(settings=None, repository=None, assistant=None, operation_interpreter=None):
     settings = settings or Settings()
     repo = repository or Repository(settings.database_url)
     clock = Clock(settings.timezone, settings.fixed_now)
-    service = Service(repo, assistant or Assistant(settings), clock)
+    interpreter = operation_interpreter
+    if interpreter is None and assistant is None and settings.unified_operations:
+        interpreter = LLMOperationInterpreter(settings)
+    service = Service(repo, assistant or Assistant(settings), clock,
+                      operation_interpreter=interpreter)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -81,7 +86,10 @@ def create_app(settings=None, repository=None, assistant=None):
     def session(request: Request, response: Response):
         uid = owner(request, response)
         with repo.connect() as con:
-            pending = con.execute('SELECT pending FROM sessions WHERE id=%s', (uid,)).fetchone()['pending']
+            state = con.execute(
+                'SELECT pending,operation_state FROM sessions WHERE id=%s', (uid,)
+            ).fetchone()
+            pending = state['operation_state'] or state['pending']
         return {'id': uid, 'now': clock.now(), 'timezone': settings.timezone,
                 'fixed_clock': bool(settings.fixed_now), 'llm_configured': bool(settings.llm_api_key), 'pending': pending}
 
@@ -105,7 +113,8 @@ def create_app(settings=None, repository=None, assistant=None):
             raise HTTPException(422, 'Поиск выполняется по всей истории; уберите фильтр периода.')
         first, last = period_bounds(period, clock.now(), date_from, date_to)
         with repo.connect() as con:
-            rows = repo.search(con, uid, query, kind) if query.strip() else repo.list_records(con, uid, first, last, kind)
+            rows = (repo.search(con, uid, query, kind, now=clock.now()) if query.strip()
+                    else repo.list_records(con, uid, first, last, kind, now=clock.now()))
         return {'records': rows, 'limit': 20 if query.strip() else 100}
 
     @app.post('/api/import/demo')
