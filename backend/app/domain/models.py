@@ -10,6 +10,7 @@ class RecordDraft(BaseModel):
     kind: Kind
     text: str = Field(min_length=1, max_length=1000)
     scheduled_date: date | None = None
+    scheduled_end_date: date | None = None
     scheduled_time: time | None = None
     duration_minutes: int | None = Field(default=None, ge=5, le=480)
     duration_source: Literal['user', 'estimated', 'unknown'] = 'unknown'

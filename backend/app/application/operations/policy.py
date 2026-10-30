@@ -1,5 +1,4 @@
 """Provider-independent invariants for complete operation plans."""
-import re
 from dataclasses import dataclass
 from datetime import datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -8,7 +7,9 @@ from app.domain.operations import (
     Action, ChangePlan, OperationIntent, PendingOperation, Phase, PolicyDecision,
     ValidationIssue, plan_fingerprint,
 )
+from app.domain.time import DateRange, PeriodExpression
 from .ports import TurnContext
+from .confirmation import build_update_confirmation
 
 
 _QUESTIONS = {
@@ -21,7 +22,7 @@ _QUESTIONS = {
 }
 
 
-def _missing_question(field, text='', explicitly_unknown=False):
+def _missing_question(field, kind_candidates=(), text='', explicitly_unknown=False):
     if explicitly_unknown:
         labels = {
             'kind': 'тип записи', 'text': 'содержание записи',
@@ -30,11 +31,11 @@ def _missing_question(field, text='', explicitly_unknown=False):
         }
         return f'Без значения поля «{labels[field]}» операцию завершить нельзя. Уточните его.'
     if field == 'kind':
-        normalized = text.lower().replace('ё', 'е')
-        if any(re.search(pattern, normalized) for pattern in (
-            r'\bсозвон\w*\b', r'\bпозвон\w*\b', r'\bвстрет\w*\b',
-        )):
-            return 'Это встреча или напоминание?'
+        labels = {'task': 'задача', 'meeting': 'встреча',
+                  'reminder': 'напоминание'}
+        candidates = tuple(kind_candidates)
+        if len(candidates) == 2 and all(item in labels for item in candidates):
+            return f'Это {labels[candidates[0]]} или {labels[candidates[1]]}?'
     return _QUESTIONS[field]
 
 
@@ -58,7 +59,18 @@ class DefaultOperationPolicy:
         if intent.ambiguous_fields:
             fields = set(intent.ambiguous_fields)
             if fields == {'kind'}:
-                question = 'Это встреча или напоминание?'
+                labels = {
+                    'task': 'задача', 'meeting': 'встреча',
+                    'reminder': 'напоминание',
+                }
+                candidates = intent.kind_candidates or ('meeting', 'reminder')
+                if len(candidates) == 2:
+                    question = (
+                        f'Это {labels[candidates[0]]} или '
+                        f'{labels[candidates[1]]}?'
+                    )
+                else:
+                    question = _QUESTIONS['kind']
             elif fields == {'time_expression', 'duration'}:
                 question = (
                     'Уточните: указанное значение означает время начала '
@@ -125,13 +137,22 @@ class DefaultOperationPolicy:
                 'scheduled_date': 'date_expression',
                 'scheduled_time': 'time_expression',
             }.get(unique[0], unique[0])
+            question = _missing_question(
+                unique[0], intent.kind_candidates, text=final.text,
+                explicitly_unknown=source_field in intent.unknown_fields,
+            )
+            if unique[0] == 'scheduled_date' and intent.changes.temporal is not None:
+                temporal = intent.changes.temporal
+                subject = 'встречу' if final.kind == 'meeting' else 'напоминание'
+                if isinstance(temporal, PeriodExpression) and temporal.unit == 'week':
+                    label = 'следующей неделе' if temporal.offset == 1 else 'этой неделе'
+                    question = f'В какой день на {label} назначить {subject}?'
+                elif isinstance(temporal, DateRange):
+                    question = f'В какой день из указанного диапазона назначить {subject}?'
             return PolicyDecision(
                 phase=Phase.NEED_FIELDS,
                 missing_fields=unique,
-                question=_missing_question(
-                    unique[0], final.text,
-                    explicitly_unknown=source_field in intent.unknown_fields,
-                ),
+                question=question,
             )
 
         try:
@@ -155,10 +176,13 @@ class DefaultOperationPolicy:
         if intent.action in self.confirmation_actions:
             confirmed = pending is not None and pending.confirmed_fingerprint == plan.fingerprint
             if not confirmed:
-                verb = 'отменить запись' if intent.action == Action.CANCEL else 'сохранить изменения'
+                if intent.action == Action.UPDATE:
+                    question = build_update_confirmation(plan.before, plan.after)
+                else:
+                    question = 'Подтвердите: отменить запись?'
                 return PolicyDecision(
                     phase=Phase.NEED_CONFIRMATION,
-                    question=f'Подтвердите: {verb}?',
+                    question=question,
                 )
         return PolicyDecision(phase=Phase.READY)
 

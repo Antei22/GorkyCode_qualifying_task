@@ -10,11 +10,14 @@ from app.application.operations import (
 from app.application.operations.codec import dump_pending, load_pending
 from app.application.operations.ports import TurnContext
 from app.application.operations.state import merge_intent, merge_patch
+from app.application.operations.confirmation import build_update_confirmation
 from app.domain.operations import (
     Action, DurationInput, DurationValue, ExecutionResult, Interpretation,
     OperationIntent, PendingOperation, Phase, RecordPatch, RecordSnapshot,
     TargetQuery, TargetResolution, TurnKind, make_change_plan,
 )
+from app.domain.time import DateRange, PeriodExpression
+from app.domain.text import clean_title
 
 
 NOW = datetime.fromisoformat('2026-10-28T12:00:00+03:00')
@@ -53,6 +56,10 @@ class Resolver:
         if selected_id is not None:
             values = tuple(item for item in values if item.id == selected_id)
         return TargetResolution(candidates=values)
+
+    def list(self, context, intent):
+        self.calls.append((intent, None))
+        return TargetResolution(candidates=self.candidates)
 
 
 class Planner:
@@ -100,9 +107,9 @@ class Executor:
         return ExecutionResult(action=plan.action, records=(plan.after,))
 
 
-def context(now=NOW):
+def context(now=NOW, message='test'):
     return TurnContext(owner_id=OWNER, request_id=REQUEST,
-                       message='test', now=now)
+                       message=message, now=now)
 
 
 def coordinator(interpreter, resolver=None, planner=None, executor=None, policy=None):
@@ -117,6 +124,56 @@ def coordinator(interpreter, resolver=None, planner=None, executor=None, policy=
 
 
 class OperationStateTests(unittest.TestCase):
+    def test_task_planner_preserves_period_and_date_range(self):
+        planner = DefaultChangePlanner()
+        period_intent = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='task', text='Купить билеты',
+                temporal=PeriodExpression(
+                    type='period', unit='week', offset=0, mode='until_end',
+                ),
+            ),
+        )
+        period_plan = planner.prepare(context(), period_intent, None)
+        self.assertEqual(period_plan.after.scheduled_date, date(2026, 10, 28))
+        self.assertEqual(period_plan.after.scheduled_end_date, date(2026, 11, 1))
+
+        range_intent = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='task', text='Подготовить отчёт',
+                temporal=DateRange(
+                    type='date_range',
+                    start={'type': 'month_day', 'month': 12, 'day': 28},
+                    end={'type': 'month_day', 'month': 1, 'day': 3},
+                ),
+            ),
+        )
+        range_plan = planner.prepare(context(), range_intent, None)
+        self.assertEqual(range_plan.after.scheduled_date, date(2026, 12, 28))
+        self.assertEqual(range_plan.after.scheduled_end_date, date(2027, 1, 3))
+
+    def test_list_flow_returns_filtered_candidates_without_planner(self):
+        meeting = snapshot(text='Встреча завтра')
+        resolver = Resolver((meeting,))
+        planner = Planner()
+        result = coordinator(
+            Interpreter(Interpretation(
+                turn=TurnKind.NEW,
+                intent=OperationIntent(
+                    action=Action.LIST,
+                    target=TargetQuery(
+                        kinds=('meeting',), date_expression='2026-10-29',
+                    ),
+                ),
+            )),
+            resolver=resolver, planner=planner,
+        ).handle(context(), None)
+        self.assertEqual(result.phase, Phase.COMPLETED)
+        self.assertEqual(result.records, (meeting,))
+        self.assertEqual(planner.calls, [])
+
     def test_patch_merge_keeps_safe_fields_and_collects_conflict(self):
         previous = OperationIntent(
             action=Action.CREATE,
@@ -160,6 +217,21 @@ class OperationStateTests(unittest.TestCase):
             allow_overwrite=True,
         )
         self.assertEqual(corrected.changes.time_expression, '11:00')
+        self.assertEqual(accepted, ('time_expression',))
+        self.assertEqual(same, ())
+        self.assertEqual(conflicts, ())
+
+    def test_user_value_replaces_system_default_without_confirmation(self):
+        previous = OperationIntent(
+            changes=RecordPatch(time_expression='10:00'),
+            field_sources={'time_expression': 'system_default'},
+        )
+        current = OperationIntent(
+            changes=RecordPatch(time_expression='11:00'),
+            field_sources={'time_expression': 'user_input'},
+        )
+        merged, accepted, same, conflicts = merge_patch(previous, current)
+        self.assertEqual(merged.changes.time_expression, '11:00')
         self.assertEqual(accepted, ('time_expression',))
         self.assertEqual(same, ())
         self.assertEqual(conflicts, ())
@@ -232,6 +304,7 @@ class OperationStateTests(unittest.TestCase):
             action=Action.CREATE,
             changes=RecordPatch(text='увидеться с Виталием',
                                 date_expression='2026-10-30'),
+            kind_candidates=('meeting', 'reminder'),
             ambiguous_fields=('kind',),
             ambiguity_evidence='Хочу увидеться с Виталием завтра',
         )
@@ -240,6 +313,22 @@ class OperationStateTests(unittest.TestCase):
         )).handle(context(), None)
         self.assertEqual(result.phase, Phase.NEED_FIELDS)
         self.assertEqual(result.question, 'Это встреча или напоминание?')
+
+    def test_todo_candidates_ask_task_or_reminder(self):
+        intent = OperationIntent(
+            action=Action.CREATE,
+            semantic_class='todo_like',
+            kind_candidates=('task', 'reminder'),
+            changes=RecordPatch(
+                text='отправить отчет', date_expression='2026-10-30',
+            ),
+            ambiguous_fields=('kind',),
+        )
+        result = coordinator(Interpreter(
+            Interpretation(turn=TurnKind.NEW, intent=intent),
+        )).handle(context(), None)
+        self.assertEqual(result.phase, Phase.NEED_FIELDS)
+        self.assertEqual(result.question, 'Это задача или напоминание?')
 
     def test_selected_ambiguity_role_clears_the_alternative_roles(self):
         previous = OperationIntent(
@@ -331,7 +420,7 @@ class OperationStateTests(unittest.TestCase):
         )
 
         completed = flow.handle(
-            context(NOW + timedelta(minutes=2)), conflict.pending,
+            context(NOW + timedelta(minutes=2), 'да'), conflict.pending,
         )
         self.assertEqual(completed.phase, Phase.COMPLETED)
         self.assertEqual(completed.records[0].scheduled_date, date(2026, 10, 29))
@@ -358,11 +447,118 @@ class OperationStateTests(unittest.TestCase):
             context(NOW + timedelta(minutes=1)), waiting.pending,
         )
         completed = flow.handle(
-            context(NOW + timedelta(minutes=2)), conflict.pending,
+            context(NOW + timedelta(minutes=2), 'нет'), conflict.pending,
         )
         self.assertEqual(completed.phase, Phase.COMPLETED)
         self.assertEqual(completed.records[0].scheduled_date, date(2026, 10, 29))
         self.assertEqual(completed.records[0].scheduled_time, time(10, 0))
+
+    def test_date_follow_up_conflict_has_concrete_confirmation_and_accepts(self):
+        initial = OperationIntent(
+            action=Action.CREATE,
+            semantic_class='todo_like',
+            changes=RecordPatch(
+                kind='reminder', text='отправить отчет',
+                date_expression='2026-10-30',
+            ),
+            field_sources={
+                'kind': 'user_input', 'text': 'user_input',
+                'date_expression': 'user_input',
+            },
+        )
+        patch = OperationIntent(
+            changes=RecordPatch(
+                date_expression='2026-11-05', time_expression='21:00',
+            ),
+            field_sources={
+                'date_expression': 'user_input',
+                'time_expression': 'user_input',
+            },
+        )
+        flow = coordinator(Interpreter(
+            Interpretation(turn=TurnKind.NEW, intent=initial),
+            Interpretation(turn=TurnKind.CONTINUE, intent=patch),
+            Interpretation(turn=TurnKind.CONFIRM),
+        ))
+        waiting = flow.handle(context(), None)
+        conflict = flow.handle(
+            context(NOW + timedelta(minutes=1), 'четверг 9 вечера'),
+            waiting.pending,
+        )
+        self.assertEqual(conflict.phase, Phase.NEED_CONFIRMATION)
+        self.assertEqual(
+            conflict.question,
+            'Вы ранее указали пятница, 30.10.2026,\n'
+            'а сейчас — четверг, 05.11.2026.\n\n'
+            'Перенести напоминание на 05.11.2026 в 21:00?',
+        )
+        self.assertEqual(
+            conflict.pending.intent.changes.date_expression, '2026-10-30',
+        )
+        self.assertEqual(
+            conflict.pending.intent.changes.time_expression, '21:00',
+        )
+        completed = flow.handle(
+            context(NOW + timedelta(minutes=2), 'да'), conflict.pending,
+        )
+        self.assertEqual(completed.records[0].scheduled_date, date(2026, 11, 5))
+        self.assertEqual(completed.records[0].scheduled_time, time(21))
+
+    def test_rejected_date_conflict_keeps_safe_new_time(self):
+        initial = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='reminder', text='отправить отчет',
+                date_expression='2026-10-30',
+            ),
+        )
+        patch = OperationIntent(changes=RecordPatch(
+            date_expression='2026-11-05', time_expression='21:00',
+        ))
+        flow = coordinator(Interpreter(
+            Interpretation(turn=TurnKind.NEW, intent=initial),
+            Interpretation(turn=TurnKind.CONTINUE, intent=patch),
+            Interpretation(turn=TurnKind.REJECT),
+        ))
+        waiting = flow.handle(context(), None)
+        conflict = flow.handle(
+            context(NOW + timedelta(minutes=1), 'четверг 9 вечера'),
+            waiting.pending,
+        )
+        completed = flow.handle(
+            context(NOW + timedelta(minutes=2), 'нет'), conflict.pending,
+        )
+        self.assertEqual(completed.records[0].scheduled_date, date(2026, 10, 30))
+        self.assertEqual(completed.records[0].scheduled_time, time(21))
+
+    def test_unknown_confirmation_message_cannot_execute_pending_update(self):
+        before = snapshot(day=date(2026, 10, 29), clock=time(10))
+        after = before.model_copy(update={'scheduled_date': date(2026, 10, 30)})
+        plan = make_change_plan('update', before, after)
+        pending = PendingOperation(
+            operation_id=OPERATION, phase=Phase.NEED_CONFIRMATION,
+            intent=OperationIntent(
+                action=Action.UPDATE,
+                target=TargetQuery(query='встреча с Дашей'),
+                changes=RecordPatch(date_expression='2026-10-30'),
+            ),
+            candidate_ids=(before.id,), selected_record_id=before.id,
+            proposed_plan=plan,
+            created_at=NOW, updated_at=NOW,
+            expires_at=NOW + timedelta(minutes=30),
+        )
+        executor = Executor()
+        result = coordinator(
+            Interpreter(Interpretation(
+                turn=TurnKind.UNKNOWN,
+                parser_used='confirmation_resolver',
+                confirmation_decision='unknown',
+            )),
+            executor=executor,
+        ).handle(context(NOW + timedelta(minutes=1)), pending)
+        self.assertEqual(result.phase, Phase.NEED_CONFIRMATION)
+        self.assertEqual(result.pending.proposed_plan, plan)
+        self.assertEqual(executor.plans, [])
 
     def test_invalid_date_becomes_clarification_and_can_be_corrected(self):
         zoned_now = NOW.astimezone(ZoneInfo('Europe/Moscow'))
@@ -417,7 +613,7 @@ class OperationStateTests(unittest.TestCase):
         )
         proposed = flow.handle(context(), None)
         created_id = proposed.pending.proposed_plan.after.id
-        done = flow.handle(context(NOW + timedelta(minutes=1)), proposed.pending)
+        done = flow.handle(context(NOW + timedelta(minutes=1), 'да'), proposed.pending)
         self.assertEqual(done.phase, Phase.COMPLETED)
         self.assertEqual(done.records[0].id, created_id)
 
@@ -442,7 +638,7 @@ class OperationStateTests(unittest.TestCase):
         self.assertEqual(choose.phase, Phase.NEED_TARGET)
         proposed = flow.handle(context(NOW + timedelta(minutes=1)), choose.pending)
         self.assertEqual(proposed.phase, Phase.NEED_CONFIRMATION)
-        done = flow.handle(context(NOW + timedelta(minutes=2)), proposed.pending)
+        done = flow.handle(context(NOW + timedelta(minutes=2), 'да'), proposed.pending)
         self.assertEqual(done.phase, Phase.COMPLETED)
         self.assertEqual(done.records[0].id, two.id)
         self.assertEqual(done.records[0].scheduled_date, date(2026, 10, 30))
@@ -482,7 +678,7 @@ class OperationStateTests(unittest.TestCase):
         )
         proposed = flow.handle(context(), None)
         resolver.candidates = (current.model_copy(update={'revision': '2'}),)
-        changed = flow.handle(context(NOW + timedelta(minutes=1)), proposed.pending)
+        changed = flow.handle(context(NOW + timedelta(minutes=1), 'да'), proposed.pending)
         self.assertEqual(changed.phase, Phase.NEED_CONFIRMATION)
         self.assertEqual(changed.issues[0].code, 'plan_changed')
         self.assertEqual(executor.plans, [])
@@ -547,6 +743,21 @@ class OperationStateTests(unittest.TestCase):
         self.assertEqual(plan.after.scheduled_time, time(18, 30))
         self.assertEqual(plan.after.duration.minutes, 90)
         self.assertEqual(plan.after.duration.source, 'user')
+
+    def test_default_planner_stores_only_canonical_title(self):
+        intent = OperationIntent(
+            action=Action.CREATE,
+            source_text='Создай встречу увидеться с Саней завтра в 10',
+            field_evidence={
+                'date_expression': 'завтра', 'time_expression': 'в 10',
+            },
+            changes=RecordPatch(
+                kind='meeting', text='увидеться с Саней завтра в 10',
+                date_expression='завтра', time_expression='10:00',
+            ),
+        )
+        plan = DefaultChangePlanner().prepare(context(), intent, None)
+        self.assertEqual(plan.after.text, 'увидеться с Саней')
 
     def test_unknown_duration_is_estimated_by_server_policy(self):
         intent = OperationIntent(
@@ -695,6 +906,106 @@ class OperationStateTests(unittest.TestCase):
         self.assertIn('точная длительность не указана', answer)
         self.assertIn('Фактическая продолжительность не зафиксирована', answer)
         self.assertNotIn('60 мин', answer)
+
+    def test_update_confirmation_date_only(self):
+        before = snapshot(text='встреча с Дашей', day=date(2026, 10, 31))
+        after = before.model_copy(update={'scheduled_date': date(2026, 11, 1)})
+        self.assertEqual(
+            build_update_confirmation(before, after),
+            'Вы действительно хотите перенести встречу «встреча с Дашей» '
+            'с 31.10.2026 на 01.11.2026?',
+        )
+
+    def test_update_confirmation_time_only(self):
+        before = snapshot(text='встреча с Дашей', clock=time(10))
+        after = before.model_copy(update={'scheduled_time': time(12)})
+        self.assertEqual(
+            build_update_confirmation(before, after),
+            'Вы действительно хотите изменить время встречи «встреча с Дашей» '
+            'с 10:00 на 12:00?',
+        )
+
+    def test_update_confirmation_date_and_time(self):
+        before = snapshot(
+            text='встреча с Дашей', day=date(2026, 10, 31), clock=time(10),
+        )
+        after = before.model_copy(update={
+            'scheduled_date': date(2026, 11, 1), 'scheduled_time': time(12),
+        })
+        message = build_update_confirmation(before, after)
+        self.assertIn('с 31.10.2026 10:00 на 01.11.2026 12:00?', message)
+
+    def test_update_confirmation_duration_only(self):
+        before = snapshot(text='встреча с Дашей', duration=60)
+        after = before.model_copy(update={
+            'duration': DurationValue(minutes=120, source='user'),
+        })
+        self.assertEqual(
+            build_update_confirmation(before, after),
+            'Вы действительно хотите изменить длительность встречи '
+            '«встреча с Дашей» с 1 часа на 2 часа?',
+        )
+
+    def test_update_confirmation_lists_every_changed_field(self):
+        before = snapshot(
+            text='встреча с Дашей', day=date(2026, 10, 31),
+            clock=time(10), duration=60,
+        )
+        after = before.model_copy(update={
+            'scheduled_date': date(2026, 11, 1),
+            'scheduled_time': time(12),
+            'duration': DurationValue(minutes=120, source='user'),
+        })
+        self.assertEqual(
+            build_update_confirmation(before, after),
+            'Вы действительно хотите изменить встречу «встреча с Дашей»?\n\n'
+            'Дата: 31.10.2026 → 01.11.2026\n'
+            'Время: 10:00 → 12:00\n'
+            'Длительность: 1 час → 2 часа',
+        )
+
+    def test_clean_title_removes_temporal_evidence(self):
+        self.assertEqual(clean_title(
+            'увидеться с Саней завтра в 10',
+            'Создай встречу увидеться с Саней завтра в 10',
+            ('завтра', 'в 10'),
+        ), 'увидеться с Саней')
+        self.assertEqual(clean_title(
+            'купить билеты до конца недели',
+            'Поставь задачу купить билеты до конца недели',
+            ('до конца недели',),
+        ), 'купить билеты')
+
+    def test_clean_title_removes_service_tail_and_kind(self):
+        self.assertEqual(clean_title(
+            'позвонить Ивану, назначь его на завтра в 10',
+            'Создай напоминание позвонить Ивану завтра в 10',
+            ('завтра', 'в 10'),
+        ), 'позвонить Ивану')
+        self.assertEqual(clean_title(
+            'Создай созвон обсудить проект на 15:00',
+            'Создай созвон обсудить проект на 15:00',
+            ('на 15:00',),
+        ), 'обсудить проект')
+
+    def test_clean_title_acceptance_reminder_with_organizational_tail(self):
+        self.assertEqual(clean_title(
+            'позвонить Ивану, назначь его на 10:00 завтра',
+            'Создай напоминание позвонить Ивану, назначь его на 10:00 завтра',
+            ('10:00', 'завтра'),
+        ), 'позвонить Ивану')
+
+    def test_clean_title_preserves_semantic_prepositions(self):
+        self.assertEqual(
+            clean_title('встреча в офисе', 'Создай встречу в офисе'),
+            'встреча в офисе',
+        )
+
+    def test_clean_title_removes_duplicate_prepositions(self):
+        self.assertEqual(
+            clean_title('увидеться с Саней на на', 'увидеться с Саней на на'),
+            'увидеться с Саней',
+        )
 
 
 if __name__ == '__main__':

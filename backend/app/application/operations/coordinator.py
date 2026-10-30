@@ -16,6 +16,7 @@ from .ports import (
     ChangePlanner, IntentInterpreter, OperationExecutor, OperationPolicy,
     TargetResolver, TurnContext,
 )
+from .confirmation import ConfirmationResolver, build_pending_change_confirmation
 from .state import (
     InvalidTransition, apply_pending_changes, merge_intent, merge_patch,
     pending_is_expired,
@@ -42,8 +43,30 @@ class OperationCoordinator:
         The method invokes at most one executor and never catches an executor error:
         Service can therefore roll back the complete request and replay request_id.
         """
-        interpretation = self.interpreter.interpret(context, pending)
-        turn = interpretation.turn
+        if pending is not None and pending.phase == Phase.NEED_CONFIRMATION:
+            turn = ConfirmationResolver.resolve(context.message)
+            interpretation = None
+            context.trace.update({
+                'parser_used': 'confirmation_resolver',
+                'confirmation_decision': {
+                    TurnKind.CONFIRM: 'confirm', TurnKind.REJECT: 'reject',
+                }.get(turn, 'unknown'),
+                'llm_output': None,
+            })
+        else:
+            interpretation = self.interpreter.interpret(context, pending)
+            turn = interpretation.turn
+
+        if (pending is not None and pending.phase == Phase.NEED_CONFIRMATION
+                and turn == TurnKind.UNKNOWN):
+            return OperationOutcome(
+                phase=Phase.NEED_CONFIRMATION,
+                pending=pending.model_copy(update={
+                    'updated_at': context.now,
+                    'expires_at': context.now + self.pending_ttl,
+                }),
+                question='Ответьте «да» для подтверждения или «нет» для отказа.',
+            )
 
         resolved_conflict_intent = None
         if (pending is not None and pending.pending_changes
@@ -105,6 +128,16 @@ class OperationCoordinator:
                     phase=Phase.REJECTED,
                     issues=(ValidationIssue(code=error.code, message=str(error)),),
                 )
+            old_values = {item.field: item.old_value for item in conflicts}
+            new_values = intent.changes.model_dump(
+                mode='json', exclude_unset=True,
+            )
+            new_values.update({item.field: item.new_value for item in conflicts})
+            confirmation_message = (
+                build_pending_change_confirmation(
+                    intent.changes.kind, old_values, new_values,
+                ) if conflicts else None
+            )
             logger.info('patch_merge %s', json.dumps({
                 'raw_text': context.message,
                 'current_draft': pending.intent.changes.model_dump(
@@ -131,6 +164,9 @@ class OperationCoordinator:
                 'same_fields': same,
                 'conflicting_fields': [item.field for item in conflicts],
                 'pending_changes': [item.model_dump(mode='json') for item in conflicts],
+                'old_values': old_values,
+                'new_values': new_values,
+                'confirmation_message': confirmation_message,
             }, ensure_ascii=False))
             if conflicts:
                 state = self._pending(
@@ -141,7 +177,7 @@ class OperationCoordinator:
                 return OperationOutcome(
                     phase=Phase.NEED_CONFIRMATION,
                     pending=state,
-                    question=self._pending_changes_question(conflicts),
+                    question=confirmation_message,
                 )
         else:
             intent = interpretation.intent or OperationIntent()
@@ -151,7 +187,19 @@ class OperationCoordinator:
             decision = self.policy.evaluate(context, intent, None, pending)
             return self._from_decision(context, intent, decision, pending)
 
-        selected_id = interpretation.selected_candidate_id
+        if intent.action == Action.LIST:
+            resolution = self.resolver.list(context, intent)
+            context.trace['candidate_ids'] = [
+                str(item.id) for item in resolution.candidates
+            ]
+            return OperationOutcome(
+                phase=Phase.COMPLETED,
+                records=resolution.candidates,
+                read_fields=intent.read_fields,
+            )
+
+        selected_id = (interpretation.selected_candidate_id
+                       if interpretation is not None else None)
         if selected_id is not None and not continuing:
             return OperationOutcome(
                 phase=Phase.REJECTED,
@@ -162,6 +210,7 @@ class OperationCoordinator:
             )
         retargeted = (
             turn == TurnKind.CONTINUE
+            and interpretation is not None
             and interpretation.intent is not None
             and bool(interpretation.intent.target.model_fields_set)
         )
@@ -217,6 +266,8 @@ class OperationCoordinator:
                     context, intent, pending, (), 'target_not_found',
                     'Подходящая запись не найдена. Уточните название или дату.',
                 )
+            if selected_id is not None:
+                context.trace['selected_id'] = str(selected_id)
             else:
                 return self._need_target(
                     context, intent, pending, candidates, 'target_ambiguous',
@@ -373,32 +424,6 @@ class OperationCoordinator:
         if kind == 'meeting' and duration_missing:
             return 'duration'
         return None
-
-    @staticmethod
-    def _pending_changes_question(changes):
-        labels = {
-            'kind': 'тип', 'text': 'текст', 'date_expression': 'дату',
-            'time_expression': 'время', 'timezone': 'часовой пояс',
-            'duration': 'длительность',
-        }
-        if len(changes) == 1:
-            change = changes[0]
-            return (
-                f'Вы ранее указали {labels[change.field]} '
-                f'{OperationCoordinator._display_value(change.old_value)}, '
-                f'а сейчас — {OperationCoordinator._display_value(change.new_value)}. '
-                f'Изменить {labels[change.field]} на '
-                f'{OperationCoordinator._display_value(change.new_value)}?'
-            )
-        old = ', '.join(
-            f'{labels[item.field]} {OperationCoordinator._display_value(item.old_value)}'
-            for item in changes
-        )
-        new = ', '.join(
-            f'{labels[item.field]} {OperationCoordinator._display_value(item.new_value)}'
-            for item in changes
-        )
-        return f'Изменить {old} на {new}?'
 
     @staticmethod
     def _display_value(value):

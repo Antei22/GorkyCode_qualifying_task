@@ -10,6 +10,7 @@ export interface RecordItem {
   kind: 'task' | 'meeting' | 'reminder' | null;
   text: string;
   scheduled_date: string | null;
+  scheduled_end_date: string | null;
   scheduled_time: string | null;
   duration_minutes: number | null;
   duration_source: 'user' | 'estimated' | 'unknown';

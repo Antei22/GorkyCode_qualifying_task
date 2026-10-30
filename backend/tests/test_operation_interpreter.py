@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
-from app.assistant.operation_interpreter import LLMOperationInterpreter
+from app.assistant.operation_interpreter import LLMOperationInterpreter, detect_explicit_kind
 from app.application.operations.ports import TurnContext
 from app.config import Settings
 from app.domain.operations import (
@@ -199,9 +199,9 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(result.turn, TurnKind.NEW)
         self.assertEqual(result.intent.target.query, 'старая задача')
         self.assertEqual(result.intent.target.kind, 'task')
-        self.assertEqual(result.intent.changes.text, 'новая задача')
+        self.assertIsNone(result.intent.changes.text)
 
-    def test_ambiguous_call_keeps_type_open_and_reminder_keeps_collected_time(self):
+    def test_call_semantics_select_meeting_and_keep_collected_time(self):
         adapter, _ = self.interpreter({
             'turn': 'new', 'action': 'create', 'kind': 'meeting',
             'kind_ambiguous': True,
@@ -210,28 +210,14 @@ class InterpreterTests(unittest.TestCase):
         })
         first_context = context('Хочу завтра созвониться с Иваном в 4 часа')
         first = adapter.interpret(first_context, None)
-        self.assertIsNone(first.intent.changes.kind)
-        self.assertEqual(first.intent.ambiguous_fields, ('kind',))
+        self.assertEqual(first.intent.changes.kind, 'meeting')
+        self.assertEqual(first.intent.semantic_class, 'meeting_like')
+        self.assertEqual(first.intent.ambiguous_fields, ())
         self.assertIn('созвониться', first.intent.changes.text.lower())
-
-        now = first_context.now
-        pending = PendingOperation(
-            operation_id=uuid4(), phase=Phase.NEED_FIELDS, intent=first.intent,
-            created_at=now, updated_at=now,
-            expires_at=now + timedelta(minutes=30),
-        )
-        second_adapter, _ = self.interpreter({
-            'turn': 'continue', 'action': 'unknown', 'kind': 'reminder',
-        })
-        second = second_adapter.interpret(context('Напоминание'), pending)
-        self.assertEqual(second.intent.changes.kind, 'reminder')
-        self.assertIsNone(second.intent.changes.date_expression)
-        self.assertNotIn('date_expression', second.intent.changes.model_fields_set)
         self.assertEqual(first.intent.changes.date_expression, '2026-10-29')
         self.assertEqual(first.intent.changes.time_expression, '16:00')
-        self.assertEqual(second.intent.target.model_fields_set, set())
 
-    def test_unsupported_model_kind_becomes_missing_field(self):
+    def test_call_semantics_override_unsupported_model_kind(self):
         adapter, _ = self.interpreter({
             'turn': 'new', 'action': 'create', 'kind': 'call',
             'text': 'созвониться с Иваном', 'date_expression': 'завтра',
@@ -239,8 +225,8 @@ class InterpreterTests(unittest.TestCase):
         result = adapter.interpret(
             context('Хочу завтра созвониться с Иваном'), None,
         )
-        self.assertIsNone(result.intent.changes.kind)
-        self.assertNotIn('kind', result.intent.changes.model_fields_set)
+        self.assertEqual(result.intent.changes.kind, 'meeting')
+        self.assertEqual(result.intent.semantic_class, 'meeting_like')
 
     def test_inflected_kind_is_normalized(self):
         adapter, _ = self.interpreter({
@@ -249,6 +235,135 @@ class InterpreterTests(unittest.TestCase):
         })
         result = adapter.interpret(context('Создай встречу'), None)
         self.assertEqual(result.intent.changes.kind, 'meeting')
+
+    def test_explicit_meeting_outweighs_weak_modal_words(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'task',
+            'text': 'назначить встречу с Иваном',
+        })
+        result = adapter.interpret(
+            context('Мне нужно назначить встречу с Иваном'), None,
+        )
+        self.assertEqual(result.intent.changes.kind, 'meeting')
+        self.assertEqual(result.intent.semantic_class, 'meeting_like')
+        self.assertEqual(result.intent.kind_candidates, ())
+
+    def test_explicit_reminder_command_overrides_meeting_like_text(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'meeting',
+            'text': 'позвонить Ивану',
+            'date': {'type': 'relative', 'days_offset': 1, 'evidence': 'завтра'},
+            'time': {'type': 'absolute', 'hour': 10, 'minute': 0,
+                     'evidence': '10 утра'},
+        })
+        result = adapter.interpret(
+            context('Напомни мне завтра в 10 утра позвонить Ивану'), None,
+        )
+        self.assertEqual(result.intent.changes.kind, 'reminder')
+        self.assertEqual(result.intent.kind_source, 'explicit_user_command')
+        self.assertEqual(result.intent.changes.text, 'позвонить Ивану')
+
+    def test_explicit_reminder_command_covers_meeting_like_verbs(self):
+        for message in (
+            'Напомни мне созвониться с Иваном завтра',
+            'Напомни мне встретиться с преподавателем в пятницу',
+        ):
+            detection = detect_explicit_kind(message)
+            self.assertIsNotNone(detection)
+            self.assertEqual(detection.kind, 'reminder')
+            self.assertEqual(detection.source, 'explicit_user_command')
+
+    def test_explicit_entity_commands_set_kind_source(self):
+        self.assertEqual(
+            detect_explicit_kind('Создай напоминание позвонить маме завтра').kind,
+            'reminder',
+        )
+        self.assertEqual(
+            detect_explicit_kind('Поставь задачу позвонить Ивану').kind,
+            'task',
+        )
+        self.assertEqual(
+            detect_explicit_kind('Назначь встречу с Иваном завтра').kind,
+            'meeting',
+        )
+
+    def test_weak_call_intent_stays_task_reminder_ambiguous(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'task',
+            'text': 'позвонить Ивану',
+            'date': {'type': 'relative', 'days_offset': 1, 'evidence': 'завтра'},
+        })
+        result = adapter.interpret(
+            context('Мне надо позвонить Ивану завтра'), None,
+        )
+        self.assertIsNone(result.intent.changes.kind)
+        self.assertEqual(result.intent.kind_candidates, ('task', 'reminder'))
+
+    def test_planned_meeting_outweighs_nado(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'task',
+            'text': 'запланировать встречу',
+            'date': {'type': 'relative', 'days_offset': 1, 'evidence': 'завтра'},
+        })
+        result = adapter.interpret(
+            context('Надо запланировать встречу на завтра'), None,
+        )
+        self.assertEqual(result.intent.changes.kind, 'meeting')
+        self.assertEqual(result.intent.semantic_class, 'meeting_like')
+
+    def test_todo_like_report_has_task_reminder_candidates(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'task',
+            'text': 'отправить отчет',
+            'date': {'type': 'weekday', 'weekday': 4, 'week_offset': 0,
+                     'evidence': 'В пятницу'},
+        })
+        result = adapter.interpret(
+            context('В пятницу мне нужно отправить отчет'), None,
+        )
+        self.assertIsNone(result.intent.changes.kind)
+        self.assertEqual(result.intent.semantic_class, 'todo_like')
+        self.assertEqual(result.intent.kind_candidates, ('task', 'reminder'))
+        self.assertEqual(result.intent.ambiguous_fields, ('kind',))
+
+    def test_todo_like_tickets_has_task_reminder_candidates(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'task',
+            'text': 'купить билеты',
+            'temporal': {'type': 'period', 'unit': 'week', 'offset': 0,
+                         'mode': 'until_end', 'evidence': 'до конца недели'},
+        })
+        result = adapter.interpret(
+            context('Надо купить билеты до конца недели'), None,
+        )
+        self.assertIsNone(result.intent.changes.kind)
+        self.assertEqual(result.intent.semantic_class, 'todo_like')
+        self.assertEqual(result.intent.kind_candidates, ('task', 'reminder'))
+
+    def test_kind_choice_preserves_todo_semantic_class(self):
+        now = context('напоминание').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_FIELDS,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                semantic_class='todo_like',
+                kind_candidates=('task', 'reminder'),
+                changes={
+                    'text': 'отправить отчет',
+                    'date_expression': '2026-10-30',
+                },
+                ambiguous_fields=('kind',),
+            ),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, _ = self.interpreter({
+            'turn': 'continue', 'action': 'unknown', 'kind': 'reminder',
+        })
+        result = adapter.interpret(context('напоминание'), pending)
+        self.assertEqual(result.intent.changes.kind, 'reminder')
+        self.assertEqual(result.intent.semantic_class, 'todo_like')
+        self.assertEqual(result.intent.kind_candidates, ())
 
     def test_numeric_absolute_date_is_normalized_to_canonical_iso(self):
         adapter, _ = self.interpreter({
@@ -432,7 +547,7 @@ class InterpreterTests(unittest.TestCase):
         result = adapter.interpret(context('Встреча с Алексеем'), pending)
         self.assertEqual(result.intent.changes.text, 'Встреча с Алексеем')
 
-    def test_meet_intention_keeps_type_open(self):
+    def test_meet_intention_is_meeting_like(self):
         adapter, _ = self.interpreter({
             'turn': 'new', 'action': 'create', 'kind': 'meeting',
             'kind_ambiguous': True,
@@ -441,10 +556,11 @@ class InterpreterTests(unittest.TestCase):
         result = adapter.interpret(
             context('Хочу встретиться с Алексеем завтра'), None,
         )
-        self.assertIsNone(result.intent.changes.kind)
-        self.assertEqual(result.intent.ambiguous_fields, ('kind',))
+        self.assertEqual(result.intent.changes.kind, 'meeting')
+        self.assertEqual(result.intent.semantic_class, 'meeting_like')
+        self.assertEqual(result.intent.ambiguous_fields, ())
 
-    def test_audit_detects_synonymous_kind_ambiguity(self):
+    def test_server_semantic_priority_overrides_kind_audit_ambiguity(self):
         adapter, client = self.interpreter({
             'turn': 'new', 'action': 'create', 'kind': 'meeting',
             'text': 'увидеться с Виталием', 'date_expression': 'завтра',
@@ -457,9 +573,10 @@ class InterpreterTests(unittest.TestCase):
         result = adapter.interpret(
             context('Хочу увидеться с Виталием завтра'), None,
         )
-        self.assertIsNone(result.intent.changes.kind)
-        self.assertEqual(result.intent.ambiguous_fields, ('kind',))
-        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(result.intent.changes.kind, 'meeting')
+        self.assertEqual(result.intent.semantic_class, 'meeting_like')
+        self.assertEqual(result.intent.ambiguous_fields, ())
+        self.assertEqual(len(client.requests), 1)
 
     def test_short_time_answer_cannot_change_pending_action(self):
         now = context('На 4 часа').now
@@ -754,11 +871,114 @@ class InterpreterTests(unittest.TestCase):
         result = adapter.interpret(
             context('Мне неудобно, какое ещё время есть?'), pending,
         )
-        self.assertEqual(result.turn, TurnKind.CONTINUE)
-        self.assertEqual(result.intent.action, Action.UNKNOWN)
-        self.assertTrue(result.intent.alternative_requested)
-        self.assertEqual(result.intent.target.model_fields_set, set())
-        self.assertEqual(result.intent.changes.model_fields_set, set())
+        self.assertEqual(result.turn, TurnKind.UNKNOWN)
+        self.assertIsNone(result.intent)
+        self.assertEqual(result.parser_used, 'confirmation_resolver')
+        self.assertEqual(result.confirmation_decision, 'unknown')
+
+    def test_confirmation_state_never_auto_confirms_target_text(self):
+        now = context('встреча с Дашей').now
+        record_id = uuid4()
+        plan = make_change_plan(
+            'update',
+            RecordSnapshot(
+                id=record_id, kind='meeting', text='встреча с Дашей',
+                scheduled_date=now.date(), scheduled_time=now.time().replace(
+                    second=0, microsecond=0, tzinfo=None,
+                ), timezone='Europe/Moscow', status='open', revision='1',
+            ),
+            RecordSnapshot(
+                id=record_id, kind='meeting', text='встреча с Дашей',
+                scheduled_date=now.date() + timedelta(days=2),
+                scheduled_time=now.time().replace(
+                    second=0, microsecond=0, tzinfo=None,
+                ), timezone='Europe/Moscow', status='open', revision='1',
+            ),
+        )
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_CONFIRMATION,
+            intent=OperationIntent(action=Action.UPDATE), proposed_plan=plan,
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, client = self.interpreter({
+            'turn': 'confirm', 'action': 'update',
+            'patch': {'date': {'type': 'relative', 'days_offset': 2,
+                               'evidence': 'послезавтра'}},
+        })
+        unknown = adapter.interpret(context('встреча с Дашей'), pending)
+        self.assertEqual(unknown.turn, TurnKind.UNKNOWN)
+        self.assertEqual(unknown.confirmation_decision, 'unknown')
+        self.assertEqual(len(client.requests), 0)
+        confirmed = adapter.interpret(context('да'), pending)
+        self.assertEqual(confirmed.turn, TurnKind.CONFIRM)
+        self.assertEqual(confirmed.confirmation_decision, 'confirm')
+
+    def test_list_guard_fixes_tomorrow_and_applies_meeting_kind(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'read',
+            'date': {
+                'type': 'weekday', 'weekday': 1, 'week_offset': 0,
+                'evidence': 'завтра',
+            },
+            'requested_fields': ['date', 'time', 'text'],
+        })
+        result = adapter.interpret(
+            context('Есть ли у меня встречи завтра?'), None,
+        )
+        self.assertEqual(result.intent.action, Action.LIST)
+        self.assertEqual(result.intent.target.kinds, ('meeting',))
+        self.assertEqual(result.intent.target.date_expression, '2026-10-29')
+
+    def test_list_kind_guards_cover_tasks_reminders_and_all_types(self):
+        cases = (
+            ('Какие задачи завтра?', 'task'),
+            ('Какие напоминания сегодня?', 'reminder'),
+            ('Что запланировано завтра?', None),
+        )
+        for message, expected_kind in cases:
+            evidence = 'сегодня' if 'сегодня' in message.lower() else 'завтра'
+            adapter, _ = self.interpreter({
+                'turn': 'new', 'action': 'read',
+                'date': {
+                    'type': 'relative',
+                    'days_offset': 0 if evidence == 'сегодня' else 1,
+                    'evidence': evidence,
+                },
+            })
+            result = adapter.interpret(context(message), None)
+            self.assertEqual(result.intent.action, Action.LIST)
+            self.assertEqual(
+                result.intent.target.kinds,
+                (expected_kind,) if expected_kind else (),
+            )
+
+    def test_single_update_date_cannot_be_duplicated_into_target(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'update',
+            'target_query': 'встреча с Дашей',
+            'date': {'type': 'weekday', 'weekday': 4, 'week_offset': 0},
+            'target_date': {'type': 'weekday', 'weekday': 4, 'week_offset': 0},
+        })
+        result = adapter.interpret(
+            context('Перенеси встречу с Дашей на послезавтра'), None,
+        )
+        self.assertEqual(result.intent.changes.date_expression, '2026-10-30')
+        self.assertNotIn('date_expression', result.intent.target.model_fields_set)
+
+    def test_until_end_period_gets_backend_mode_and_current_evidence(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'task',
+            'date': {'type': 'period', 'unit': 'week'},
+        })
+        result = adapter.interpret(
+            context('Поставь задачу купить билеты до конца недели'), None,
+        )
+        self.assertEqual(result.intent.changes.text, 'купить билеты')
+        self.assertEqual(result.intent.changes.temporal.mode, 'until_end')
+        self.assertEqual(
+            result.intent.changes.temporal.evidence, 'до конца недели',
+        )
 
 
 if __name__ == '__main__':

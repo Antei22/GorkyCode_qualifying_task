@@ -53,6 +53,9 @@ class DefaultOutcomePresenter:
         if record.scheduled_date is None:
             return ''
         value = record.scheduled_date.strftime('%d.%m.%Y')
+        if (record.scheduled_end_date is not None
+                and record.scheduled_end_date != record.scheduled_date):
+            value += f'–{record.scheduled_end_date:%d.%m.%Y}'
         if record.scheduled_time is not None:
             value += f' в {record.scheduled_time:%H:%M}'
         return f' — {value}'

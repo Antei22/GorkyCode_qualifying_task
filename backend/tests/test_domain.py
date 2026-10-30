@@ -4,9 +4,10 @@ from datetime import date, time
 from pathlib import Path
 from app.domain.models import DomainError
 from app.domain.time import (
-    AbsoluteDate, Clock, MonthDayDate, ParsedTime, PeriodDate, RelativeDate,
+    AbsoluteDate, Clock, DateRange, MonthDayDate, ParsedTime, PeriodDate,
+    PeriodExpression, RelativeDate,
     WeekdayDate, parse_day, parse_time, period_bounds, resolve_date,
-    resolve_time, schedule, normalize_date_payload,
+    resolve_time, schedule, normalize_date_payload, resolve_temporal,
 )
 from app.ingestion.csv_import import read_csv
 
@@ -59,6 +60,70 @@ class TimeTests(unittest.TestCase):
         }), {
             'type': 'relative', 'days_offset': 1, 'evidence': 'на завтра',
         })
+
+    def test_basic_relative_guard_overrides_wrong_model_type(self):
+        guarded = normalize_date_payload({
+            'type': 'weekday', 'weekday': 1, 'week_offset': 0,
+            'evidence': 'завтра',
+        })
+        self.assertEqual(guarded, {
+            'type': 'relative', 'days_offset': 1, 'evidence': 'завтра',
+        })
+        self.assertEqual(
+            resolve_date(RelativeDate.model_validate(guarded), self.now),
+            date(2026, 10, 28),
+        )
+
+    def test_weekday_evidence_overrides_incomplete_relative_payload(self):
+        self.assertEqual(normalize_date_payload({
+            'type': 'relative', 'evidence': 'В пятницу',
+        }), {
+            'type': 'weekday', 'weekday': 4, 'week_offset': 0,
+            'evidence': 'В пятницу',
+        })
+
+    def test_relative_period_and_date_range_resolution(self):
+        for offset, expected in (
+            (0, date(2026, 10, 27)), (1, date(2026, 10, 28)),
+            (2, date(2026, 10, 29)), (5, date(2026, 11, 1)),
+        ):
+            self.assertEqual(resolve_date(RelativeDate(
+                type='relative', days_offset=offset,
+            ), self.now), expected)
+        current = resolve_temporal(PeriodExpression(
+            type='period', unit='week', offset=0, mode='whole',
+        ), self.now)
+        self.assertEqual((current.start, current.end), (
+            date(2026, 10, 26), date(2026, 11, 1),
+        ))
+        following = resolve_temporal(PeriodExpression(
+            type='period', unit='week', offset=1, mode='whole',
+        ), self.now)
+        self.assertEqual((following.start, following.end), (
+            date(2026, 11, 2), date(2026, 11, 8),
+        ))
+        until_end = resolve_temporal(PeriodExpression(
+            type='period', unit='week', offset=0, mode='until_end',
+        ), self.now)
+        self.assertEqual((until_end.start, until_end.end), (
+            date(2026, 10, 27), date(2026, 11, 1),
+        ))
+        november = resolve_temporal(DateRange(
+            type='date_range',
+            start={'type': 'month_day', 'month': 11, 'day': 8},
+            end={'type': 'month_day', 'month': 11, 'day': 11},
+        ), self.now)
+        self.assertEqual((november.start, november.end), (
+            date(2026, 11, 8), date(2026, 11, 11),
+        ))
+        new_year = resolve_temporal(DateRange(
+            type='date_range',
+            start={'type': 'month_day', 'month': 12, 'day': 28},
+            end={'type': 'month_day', 'month': 1, 'day': 3},
+        ), self.now)
+        self.assertEqual((new_year.start, new_year.end), (
+            date(2026, 12, 28), date(2027, 1, 3),
+        ))
 
     def test_structured_month_day_skips_invalid_leap_year(self):
         end_of_year = Clock(fixed_now='2026-12-31T12:00:00+03:00').now()

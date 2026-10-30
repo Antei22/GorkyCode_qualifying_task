@@ -1,4 +1,6 @@
 """Chat transaction, history, draft state and request idempotency."""
+import json
+import logging
 import re
 from psycopg.types.json import Jsonb
 from fastapi.encoders import jsonable_encoder
@@ -14,6 +16,9 @@ from app.application.operations.ports import TurnContext
 from app.storage.operation_adapters import (
     PostgresOperationExecutor, PostgresTargetResolver,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class Service:
@@ -107,6 +112,12 @@ class Service:
                 now=self.clock.now(),
                 history=tuple((row['role'], row['content']) for row in history_rows),
             )
+            context.trace.update({
+                'raw_text': message,
+                'phase': pending.phase if pending else 'new',
+                'pending_before': (pending.model_dump(mode='json', exclude_unset=True)
+                                   if pending else None),
+            })
             resolver = PostgresTargetResolver(
                 self.repo, con, hybrid_search=self.hybrid_search,
             )
@@ -119,6 +130,17 @@ class Service:
             )
             outcome = coordinator.handle(context, pending)
             state_payload = dump_pending(outcome.pending) if outcome.pending else None
+            context.trace.update({
+                'pending_after': state_payload,
+                'selected_id': (str(outcome.pending.selected_record_id)
+                                if outcome.pending and outcome.pending.selected_record_id
+                                else context.trace.get('selected_id')),
+                'confirmation_decision': context.trace.get('confirmation_decision'),
+            })
+            logger.info(
+                'operation_turn %s',
+                json.dumps(context.trace, ensure_ascii=False, default=str),
+            )
             con.execute(
                 'UPDATE sessions SET operation_state=%s WHERE id=%s',
                 (Jsonb(state_payload) if state_payload else None, owner),
@@ -156,6 +178,7 @@ class Service:
         return {
             'id': item.id, 'kind': item.kind, 'text': item.text,
             'scheduled_date': item.scheduled_date,
+            'scheduled_end_date': item.scheduled_end_date,
             'scheduled_time': item.scheduled_time,
             'duration_minutes': item.duration.minutes,
             'duration_source': item.duration.source,

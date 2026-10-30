@@ -9,8 +9,34 @@ from app.domain.operations import (
     RecordSnapshot, make_change_plan,
 )
 from datetime import date, time
-from app.domain.time import parse_day, parse_time
+from app.domain.time import parse_day, parse_time, resolve_temporal
+from app.domain.text import clean_title
 from .ports import TurnContext
+
+
+class TaskPlanner:
+    @staticmethod
+    def apply_temporal(values, bounds):
+        values['scheduled_date'] = bounds.start
+        values['scheduled_end_date'] = bounds.end
+
+
+class MeetingPlanner:
+    @staticmethod
+    def apply_temporal(values, bounds):
+        values['scheduled_date'] = bounds.start if bounds.start == bounds.end else None
+        values['scheduled_end_date'] = None
+
+
+class ReminderPlanner(MeetingPlanner):
+    pass
+
+
+ENTITY_PLANNERS = {
+    'task': TaskPlanner,
+    'meeting': MeetingPlanner,
+    'reminder': ReminderPlanner,
+}
 
 
 @dataclass(frozen=True)
@@ -38,6 +64,7 @@ class DefaultChangePlanner:
             zone = getattr(context.now.tzinfo, 'key', None) or str(context.now.tzinfo)
             values = RecordSnapshot(
                 id=record_id, kind=None, text='', scheduled_date=None,
+                scheduled_end_date=None,
                 scheduled_time=None, timezone=zone,
                 user_duration=None, duration_status='defaulted',
                 duration=DurationValue(), status='open', revision='new',
@@ -50,7 +77,12 @@ class DefaultChangePlanner:
             if 'kind' in supplied:
                 values['kind'] = patch.kind
             if 'text' in supplied:
-                values['text'] = patch.text or ''
+                evidence = tuple(intent.field_evidence.values())
+                values['text'] = (
+                    clean_title(
+                        patch.text, intent.source_text or patch.text, evidence,
+                    ) if patch.text else ''
+                )
             if 'timezone' in supplied:
                 values['timezone'] = patch.timezone or ''
             self._apply_schedule(values, patch, supplied, context)
@@ -80,12 +112,19 @@ class DefaultChangePlanner:
             values['status'] = 'cancelled'
 
         after = RecordSnapshot.model_validate(values)
-        return make_change_plan(intent.action.value, before, after)
+        plan = make_change_plan(intent.action.value, before, after)
+        context.trace['planner_result'] = plan.model_dump(mode='json')
+        return plan
 
     @staticmethod
     def _apply_schedule(values, patch, supplied, context):
         has_day = 'date_expression' in supplied
+        has_temporal = 'temporal' in supplied and patch.temporal is not None
         has_time = 'time_expression' in supplied
+        if has_temporal:
+            bounds = resolve_temporal(patch.temporal, context.now)
+            entity_planner = ENTITY_PLANNERS.get(values.get('kind'), MeetingPlanner)
+            entity_planner.apply_temporal(values, bounds)
         if has_day and patch.date_expression:
             try:
                 day = date.fromisoformat(patch.date_expression)
@@ -94,6 +133,7 @@ class DefaultChangePlanner:
                 # structured temporal contract was introduced.
                 day = parse_day(patch.date_expression, context.now)
             values['scheduled_date'] = day
+            values['scheduled_end_date'] = None
             if has_time:
                 if not patch.time_expression:
                     values['scheduled_time'] = None
@@ -106,6 +146,7 @@ class DefaultChangePlanner:
                         values['scheduled_time'] = parse_time(patch.time_expression)
         elif has_day:
             values['scheduled_date'] = None
+            values['scheduled_end_date'] = None
         if has_time and not has_day:
             if not patch.time_expression:
                 values['scheduled_time'] = None

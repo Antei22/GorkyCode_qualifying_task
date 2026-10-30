@@ -7,7 +7,7 @@ from app.domain.operations import (
     Action, DurationInput, Interpretation, OperationIntent, RecordPatch,
     TargetQuery, TurnKind,
 )
-from app.domain.time import Clock
+from app.domain.time import Clock, PeriodExpression
 from app.service import Service
 from app.storage.repository import Repository
 
@@ -24,6 +24,17 @@ class ScriptedInterpreter:
                     kind='meeting', text='Встреча с Марией',
                     date_expression='завтра', time_expression='11:00',
                     duration=DurationInput(minutes=60),
+                ),
+            ))
+        if message == 'создай задачу до конца недели':
+            return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
+                action=Action.CREATE,
+                changes=RecordPatch(
+                    kind='task', text='Купить билеты',
+                    temporal=PeriodExpression(
+                        type='period', unit='week', offset=0,
+                        mode='until_end', evidence='до конца недели',
+                    ),
                 ),
             ))
         if message == 'создай конфликтующую встречу':
@@ -155,7 +166,14 @@ class UnifiedPostgresTests(unittest.TestCase):
 
         proposed = self.chat('перенеси и переименуй встречу')
         self.assertTrue(proposed['pending'])
-        self.assertIn('Подтвердите', proposed['answer'])
+        self.assertIn('Вы действительно хотите изменить встречу', proposed['answer'])
+        self.assertIn('Дата: 29.10.2026 → 30.10.2026', proposed['answer'])
+        self.assertIn('Время: 11:00 → 18:00', proposed['answer'])
+        self.assertIn('Длительность: 1 час → 1 ч 30 мин.', proposed['answer'])
+        self.assertIn(
+            'Название: Встреча с Марией → Переговоры с Марией',
+            proposed['answer'],
+        )
         before = self.rows()[0]
         self.assertEqual(str(before['scheduled_date']), '2026-10-29')
 
@@ -170,6 +188,15 @@ class UnifiedPostgresTests(unittest.TestCase):
         self.assertEqual(row['duration_minutes'], 90)
         self.assertEqual(row['version'], 2)
 
+    def test_task_period_persists_start_and_end_dates(self):
+        created = self.chat('создай задачу до конца недели')
+        self.assertIsNone(created['pending'])
+        self.assertEqual(created['records'][0]['scheduled_date'], '2026-10-28')
+        self.assertEqual(created['records'][0]['scheduled_end_date'], '2026-11-01')
+        row = self.rows()[0]
+        self.assertEqual(row['scheduled_date'], date(2026, 10, 28))
+        self.assertEqual(row['scheduled_end_date'], date(2026, 11, 1))
+
     def test_conflict_proposes_and_confirms_nearest_free_time(self):
         self.chat('создай первую встречу')
         proposed = self.chat('создай конфликтующую встречу')
@@ -183,19 +210,18 @@ class UnifiedPostgresTests(unittest.TestCase):
         rows = {row['text']: row for row in self.rows()}
         self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(12))
 
-    def test_conflict_can_offer_the_next_alternative(self):
+    def test_confirmation_state_rejects_non_confirmation_text(self):
         self.chat('создай первую встречу')
         first = self.chat('создай конфликтующую встречу')
         self.assertIn('12:00', first['answer'])
 
         second = self.chat('покажи другое время')
-        self.assertIn('Следующее свободное время', second['answer'])
-        self.assertIn('12:30', second['answer'])
+        self.assertIn('Ответьте «да»', second['answer'])
         self.assertEqual(len(self.rows()), 1)
 
         completed = self.chat('да')
         rows = {row['text']: row for row in self.rows()}
-        self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(12, 30))
+        self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(12))
 
     def test_read_has_no_write_and_cancel_needs_confirmation(self):
         self.chat('создай первую встречу')

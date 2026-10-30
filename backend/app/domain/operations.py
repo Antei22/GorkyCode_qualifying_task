@@ -12,10 +12,21 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .models import Kind
+from .time import ParsedDate
 
 
 OperationField = Literal[
-    'kind', 'text', 'date_expression', 'time_expression', 'timezone', 'duration',
+    'kind', 'text', 'date_expression', 'temporal', 'time_expression',
+    'timezone', 'duration',
+]
+SemanticClass = Literal[
+    'meeting_like', 'todo_like', 'reminder_like', 'info_query',
+    'update_request',
+]
+ValueSource = Literal['user_input', 'system_default', 'derived']
+KindSource = Literal[
+    'explicit_user_command', 'explicit_entity_word', 'semantic_inference',
+    'user_clarification', 'system_default',
 ]
 DurationStatus = Literal[
     'missing', 'provided', 'declined_to_specify', 'defaulted',
@@ -31,6 +42,7 @@ class Action(str, Enum):
     UPDATE = 'update'
     CANCEL = 'cancel'
     READ = 'read'
+    LIST = 'list'
     UNKNOWN = 'unknown'
 
 
@@ -107,6 +119,7 @@ class RecordPatch(Contract):
     kind: Kind | None = None
     text: str | None = Field(default=None, min_length=1, max_length=1000)
     date_expression: str | None = None
+    temporal: ParsedDate | None = None
     time_expression: str | None = None
     timezone: str | None = None
     duration: DurationInput | None = None
@@ -116,7 +129,8 @@ class TargetQuery(Contract):
     """Filters refer to the existing record, not to proposed new field values."""
     query: str | None = None
     kind: Kind | None = None
-    temporal: Literal['future', 'past', 'all', 'unspecified'] = 'unspecified'
+    kinds: tuple[Kind, ...] = ()
+    temporal: Literal['future', 'past', 'all', 'unspecified'] | ParsedDate = 'unspecified'
     date_expression: str | None = None
     time_expression: str | None = None
 
@@ -126,6 +140,10 @@ class OperationIntent(Contract):
     # Original command and source excerpts survive while a clarification is pending.
     source_text: str | None = None
     field_evidence: dict[str, str] = Field(default_factory=dict)
+    field_sources: dict[OperationField, ValueSource] = Field(default_factory=dict)
+    semantic_class: SemanticClass | None = None
+    kind_candidates: tuple[Kind, ...] = ()
+    kind_source: KindSource | None = None
     target: TargetQuery = Field(default_factory=TargetQuery)
     changes: RecordPatch = Field(default_factory=RecordPatch)
     read_fields: tuple[str, ...] = ()
@@ -148,6 +166,10 @@ class Interpretation(Contract):
     turn: TurnKind = TurnKind.UNKNOWN
     intent: OperationIntent | None = None
     selected_candidate_id: UUID | None = None
+    parser_used: Literal['operation_parser', 'target_parser',
+                         'confirmation_resolver', 'deterministic'] = 'operation_parser'
+    llm_output: dict[str, Any] | None = None
+    confirmation_decision: Literal['confirm', 'reject', 'unknown'] | None = None
 
 
 class RecordSnapshot(Contract):
@@ -156,6 +178,7 @@ class RecordSnapshot(Contract):
     kind: Kind | None
     text: str
     scheduled_date: date | None
+    scheduled_end_date: date | None = None
     scheduled_time: time | None
     timezone: str
     user_duration: DurationInput | None = None
@@ -227,6 +250,8 @@ class PendingChange(Contract):
     field: OperationField
     old_value: Any
     new_value: Any
+    old_source: ValueSource = 'user_input'
+    new_source: ValueSource = 'user_input'
 
 
 class PendingOperation(Contract):
