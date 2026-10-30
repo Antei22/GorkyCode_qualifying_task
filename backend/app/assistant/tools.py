@@ -4,7 +4,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from psycopg.types.json import Jsonb
 from app.domain.models import DomainError, Kind, RecordDraft
-from app.domain.time import parse_time, period_bounds, schedule
+from app.domain.time import parse_day, parse_time, period_bounds, schedule
+from app.domain.duration import cancellation_requested, duration_request, explicit_duration
 
 
 PENDING_TTL = timedelta(minutes=30)
@@ -48,6 +49,25 @@ class CreateRecord(Arguments):
                                         description='Выражение времени словами пользователя')
     duration_minutes: int | None = Field(default=None, ge=5, le=480,
                                          description='Явно названная длительность события в минутах')
+    duration_unspecified: bool = Field(default=False,
+        description='Пользователь прямо сказал, что не знает длительность; не подставлять выдуманные минуты')
+
+
+class GetMeetingDuration(Arguments):
+    """Узнать длительность встречи. Будущее и история доступны отдельно; оценки не являются точными данными."""
+    query: str = Field(min_length=1, max_length=300)
+    temporal: Literal['future', 'past', 'all'] = 'future'
+    date_expression: str | None = None
+
+
+class UpdateMeetingDuration(Arguments):
+    """Изменить длительность существующей будущей встречи. Никогда не отменяет и не создаёт запись."""
+    mode: Literal['start', 'continue'] = 'start'
+    query: str | None = Field(default=None, min_length=1, max_length=300)
+    date_expression: str | None = None
+    duration_minutes: int | None = Field(default=None, ge=5, le=480)
+    duration_description: str | None = Field(default=None, max_length=300,
+        description='Слова пользователя без точных минут, например «долго» или «не знаю»')
 
 
 class ListRecords(Arguments):
@@ -71,6 +91,7 @@ class CancelRecord(Arguments):
     """Отменить существующую запись по краткому описанию. Если найдено несколько записей, запросить уточнение."""
     query: str = Field(min_length=1, max_length=300,
                        description='Ключевые слова из описания отменяемой записи')
+    kind: Kind | None = Field(default=None, description='Явно названный пользователем тип записи')
 
 
 class AskClarification(Arguments):
@@ -80,6 +101,8 @@ class AskClarification(Arguments):
 
 MODELS = {'create_record': CreateRecord, 'list_records': ListRecords,
           'search_records': SearchRecords, 'cancel_record': CancelRecord,
+          'get_meeting_duration': GetMeetingDuration,
+          'update_meeting_duration': UpdateMeetingDuration,
           'ask_clarification': AskClarification}
 
 
@@ -96,6 +119,9 @@ class Tools:
         self.expired_pending = False
         self.created = []
         self.cancelled = []
+        self.updated = []
+        self.answers = []
+        self.user_message = ''
         self.found = {}
         self.questions = []
         self.errors = []
@@ -122,6 +148,13 @@ class Tools:
         if name not in MODELS:
             return {'error': 'Unknown tool'}
         try:
+            if name == 'cancel_record' and not cancellation_requested(self.user_message):
+                raise DomainError('Отмена не запрошена. Для изменения длительности используйте изменение встречи.')
+            intent = duration_request(self.user_message)
+            if intent and intent['action'] == 'read' and name in {'create_record', 'update_meeting_duration'}:
+                raise DomainError('Это вопрос о длительности. Изменение записи не запрошено.')
+            if intent and intent['action'] == 'update' and name == 'create_record':
+                raise DomainError('Измените существующую встречу через update_meeting_duration.')
             args = MODELS[name].model_validate(arguments)
             return getattr(self, name)(args)
         except DomainError as error:
@@ -147,9 +180,7 @@ class Tools:
                          (Jsonb(pending) if pending else None, self.owner))
 
     @staticmethod
-    def _meeting_duration(text, explicit=None):
-        if explicit is not None:
-            return explicit
+    def default_meeting_duration(text):
         value = text.lower().replace('ё', 'е')
         if any(word in value for word in ('конференц', 'воркшоп', 'тренинг', 'презентац')):
             return 120
@@ -198,6 +229,8 @@ class Tools:
 
     def create_record(self, args):
         if args.mode == 'continue':
+            if (self.pending or {}).get('_duration_update'):
+                raise DomainError('Ожидается изменение длительности существующей встречи, а не создание новой.')
             if not self.pending:
                 if self.expired_pending:
                     raise DomainError('Черновик устарел. Начните создание заново.')
@@ -210,10 +243,22 @@ class Tools:
             data = {}
         original_data = dict(data)
 
-        supplied = args.model_dump(exclude_none=True, exclude={'mode'})
+        supplied = args.model_dump(exclude_none=True, exclude={'mode', 'duration_unspecified'})
         for key in ('kind', 'text', 'duration_minutes'):
             if key in supplied:
                 data[key] = supplied[key]
+        if args.duration_minutes is not None:
+            data['_duration_source'] = (
+                'user' if explicit_duration(self.user_message) == args.duration_minutes
+                else original_data.get('_duration_source', 'unknown')
+                if original_data.get('duration_minutes') == args.duration_minutes else 'unknown')
+            data.pop('_duration_description', None)
+        elif args.duration_unspecified:
+            description = self.user_message.strip()
+            data['duration_minutes'] = (120 if 'долго' in description.lower()
+                                        else self.default_meeting_duration(data.get('text', '')))
+            data['_duration_source'] = 'estimated'
+            data['_duration_description'] = description
 
         validation_errors = []
         if 'date_expression' in supplied:
@@ -271,6 +316,8 @@ class Tools:
                 missing.append('date')
             if moment is None:
                 missing.append('time')
+        if data.get('kind') == 'meeting' and data.get('duration_minutes') is None:
+            missing.append('duration')
         if moment is not None and day is None:
             missing.append('date')
         if missing:
@@ -280,6 +327,7 @@ class Tools:
                 'text': 'Что должно быть записано?',
                 'date': 'На какую дату?',
                 'time': 'На какое время?',
+                'duration': 'Сколько будет длиться встреча?',
             }
             question = questions[missing[0]]
             self.questions.append(question)
@@ -287,7 +335,7 @@ class Tools:
             return {'needs_clarification': True, 'missing_field': missing[0],
                     'suggested_question': question, 'draft': self.pending}
         if data['kind'] == 'meeting':
-            duration = self._meeting_duration(data['text'], data.get('duration_minutes'))
+            duration = data['duration_minutes']
             requested = datetime.combine(day, moment)
             conflict, nearest = self._nearest_free_slot(requested, duration)
             if conflict:
@@ -321,6 +369,8 @@ class Tools:
         draft = RecordDraft(kind=data['kind'], text=data['text'], scheduled_date=day,
                             scheduled_time=moment,
                             duration_minutes=data.get('duration_minutes'),
+                            duration_source=data.get('_duration_source', 'unknown'),
+                            duration_description=data.get('_duration_description'),
                             timezone=self.clock.zone.key)
         signature = draft.model_dump_json()
         if signature in self.signatures:
@@ -333,7 +383,8 @@ class Tools:
 
     def list_records(self, args):
         first, last = period_bounds(args.period, self.clock.now(), args.date_from, args.date_to)
-        rows = self.repo.list_records(self.con, self.owner, first, last, args.kind)
+        rows = self.repo.list_records(self.con, self.owner, first, last, args.kind,
+                                      now=self.clock.now())
         self.read_count += 1
         self.response_mode = 'read'
         self.result_limit = 100
@@ -342,7 +393,8 @@ class Tools:
                 'note': 'Импортированные записи имеют неизвестный тип (kind=null).'}
 
     def search_records(self, args):
-        rows = self.repo.search(self.con, self.owner, args.query, args.kind)
+        rows = self.repo.search(self.con, self.owner, args.query, args.kind,
+                                now=self.clock.now())
         self.read_count += 1
         self.response_mode = 'read'
         self.result_limit = 20
@@ -351,8 +403,15 @@ class Tools:
                 'note': 'Неизвестный тип импорта не доказывает, что запись — задача или встреча.'}
 
     def cancel_record(self, args):
-        rows = self.repo.search(self.con, self.owner, args.query, limit=10)
+        now = self.clock.now()
+        rows = self.repo.search(self.con, self.owner, args.query, args.kind, limit=10,
+                                now=now, future_only=True)
         if not rows:
+            past_rows = self.repo.search(self.con, self.owner, args.query, args.kind,
+                                         limit=1, now=now)
+            if past_rows:
+                self.errors.append('Эта запись уже прошла, поэтому отменить её нельзя.')
+                return {'error': self.errors[-1]}
             self.errors.append('Не нашёл активную запись по этому описанию. Уточните название встречи или задачи.')
             return {'error': self.errors[-1]}
         if len(rows) > 1:
@@ -361,12 +420,110 @@ class Tools:
             self.found.update({str(row['id']): row for row in rows})
             self.read_count += 1
             return {'needs_clarification': True, 'records': rows}
-        record = self.repo.cancel_record(self.con, self.owner, rows[0]['id'])
+        record = self.repo.cancel_record(self.con, self.owner, rows[0]['id'], now=now)
         if not record:
             self.errors.append('Запись уже отменена или недоступна.')
             return {'error': self.errors[-1]}
         self.cancelled.append(record)
         return {'cancelled': record}
+
+    def _duration_candidates(self, query, temporal, date_expression=None):
+        day = parse_day(date_expression, self.clock.now()) if date_expression else None
+        if day and temporal == 'past' and day > self.clock.now().date() and not any(c.isdigit() for c in (date_expression or '')[-4:]):
+            day = day.replace(year=day.year - 1)
+        return self.repo.duration_candidates(self.con, self.owner, query, self.clock.now(),
+                                             temporal='all' if day else temporal, day=day)
+
+    def get_meeting_duration(self, args):
+        intent = duration_request(self.user_message)
+        temporal = intent['temporal'] if intent and intent['action'] == 'read' else args.temporal
+        date_expression = (intent or {}).get('date_expression') or args.date_expression
+        rows = self._duration_candidates(args.query, temporal, date_expression)
+        self.found.update({str(row['id']): row for row in rows})
+        if not rows:
+            answer = 'Не нашёл встречу по этому описанию и времени. Уточните дату или название.'
+        else:
+            lines = []
+            for row in rows:
+                label = f"«{row['text']}» — {row['scheduled_date']} {row['scheduled_time'] or ''}"
+                if row.get('duration_source') == 'user' and row.get('duration_minutes') is not None:
+                    detail = f"указанная плановая длительность — {row['duration_minutes']} мин."
+                else:
+                    detail = 'Точная длительность не указана.'
+                    if row.get('duration_description') and 'долго' in row['duration_description'].lower():
+                        detail += ' Указано только, что встреча будет долгой.'
+                    if row.get('duration_minutes') is not None:
+                        detail += ' Для расписания используется приблизительная оценка.'
+                if row['scheduled_date'] and datetime.combine(row['scheduled_date'], row['scheduled_time'] or time.max) < self.clock.now().replace(tzinfo=None):
+                    detail += ' Фактическая продолжительность не зафиксирована.'
+                lines.append(label + ': ' + detail)
+            answer = '\n'.join(lines)
+            if len(rows) > 1:
+                answer += '\nНайдено несколько встреч. Уточните дату нужной встречи.'
+            if len(rows) == 20:
+                answer += '\nПоказаны первые 20 совпадений.'
+        self.answers.append(answer)
+        return {'answer': answer, 'records': rows}
+
+    def update_meeting_duration(self, args):
+        continuing = args.mode == 'continue' and (self.pending or {}).get('_duration_update')
+        intent = duration_request(self.user_message)
+        if not continuing and not (intent and intent['action'] == 'update'):
+            raise DomainError('Изменение длительности не запрошено.')
+        query = args.query or (continuing or {}).get('query')
+        if not query:
+            raise DomainError('Уточните, у какой встречи изменить длительность.')
+        date_expression = args.date_expression or (continuing or {}).get('date_expression')
+        rows = self._duration_candidates(query, 'future', date_expression)
+        if continuing and continuing.get('id'):
+            rows = [row for row in rows if str(row['id']) == continuing['id']]
+        if not rows:
+            raise DomainError('Не нашёл будущую встречу для изменения длительности.')
+        if len(rows) > 1:
+            minutes = args.duration_minutes if args.duration_minutes is not None else (continuing or {}).get('minutes')
+            if minutes is not None and explicit_duration(self.user_message) != minutes and (continuing or {}).get('minutes') != minutes:
+                raise DomainError('Уточните длительность в минутах или часах: точное значение не указано.')
+            self.save_pending({'_duration_update': {
+                'query': query, 'minutes': minutes,
+                'description': args.duration_description or (continuing or {}).get('description'),
+            }})
+            self.found.update({str(row['id']): row for row in rows})
+            self.questions.append('Найдено несколько встреч. Уточните дату нужной встречи:\n' + '\n'.join(
+                f"• {r['text']} — {r['scheduled_date']} {r['scheduled_time'] or ''}" for r in rows))
+            return {'needs_clarification': True, 'records': rows}
+        row = rows[0]
+        if row['kind'] != 'meeting':
+            raise DomainError('Тип импортированной записи неизвестен. Изменение её длительности недоступно.')
+        description = args.duration_description or (continuing or {}).get('description')
+        minutes = args.duration_minutes if args.duration_minutes is not None else (continuing or {}).get('minutes')
+        if minutes is None and not description:
+            self.save_pending({'_duration_update': {
+                'id': str(row['id']), 'query': query, 'date_expression': date_expression}})
+            self.questions.append('Какую длительность указать? Можно назвать минуты или сказать, что точное время неизвестно.')
+            return {'needs_clarification': True}
+        source = 'user' if minutes is not None else 'estimated'
+        if (minutes is not None and explicit_duration(self.user_message) != minutes
+                and (continuing or {}).get('minutes') != minutes):
+            raise DomainError('Уточните длительность в минутах или часах: точное значение не указано.')
+        if minutes is None:
+            minutes = 120 if 'долго' in description.lower() else self.default_meeting_duration(row['text'])
+        record = self.repo.update_duration(self.con, self.owner, row['id'], minutes,
+                                           source, description, self.clock.now())
+        if not record:
+            raise DomainError('Встреча уже прошла, отменена или недоступна.')
+        self.updated.append(record)
+        if (self.pending or {}).get('_duration_update'):
+            self.save_pending(None)
+        # Expanding a duration can introduce a conflict; report it without moving events.
+        start = datetime.combine(record['scheduled_date'], record['scheduled_time'])
+        meetings = self.repo.meetings_between(self.con, self.owner, start.date() - timedelta(days=1), start.date() + timedelta(days=1))
+        for other in meetings:
+            if other['id'] == record['id']:
+                continue
+            other_start = datetime.combine(other['scheduled_date'], other['scheduled_time'])
+            if other_start < start + timedelta(minutes=minutes) and other_start + timedelta(minutes=other.get('duration_minutes') or 60) > start:
+                self.answers.append(f"Обновлённая встреча пересекается с «{other['text']}» — {other['scheduled_date']} {other['scheduled_time']}.")
+        return {'updated': record}
 
     def ask_clarification(self, args):
         self.questions.append(args.question)
