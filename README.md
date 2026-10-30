@@ -57,7 +57,7 @@ DATABASE_URL=postgresql://gorky:gorky-local-only@localhost:5434/gorky
 # OpenAI-compatible provider, e.g. your separately running gpt2giga.
 # host.docker.internal reaches a host service from Docker Desktop.
 LLM_BASE_URL=https://openrouter.ai/api/v1
-LLM_API_KEY=sk-or-v1-8beb12b84368823d835a0УДАЛИТЬЭТОТТЕКСТ3b833c9c0c26ed73bd17389d2107e8ba56052a7ea6d
+LLM_API_KEY=сюда нужно вставить ключ, доступный по ссылке https://disk.360.yandex.ru/i/I5vIJrU1ERQQwA (сразу после = без пробелов)
 LLM_MODEL=google/gemma-4-26b-a4b-it
 LLM_TIMEOUT_SECONDS=60
 # Optional bundled proxy: set LLM_BASE_URL=http://gpt2giga:8090/v1,
