@@ -1,4 +1,4 @@
-# GorkyCode — голосовой ассистент задач и встреч
+# GorkyCode — голосовой ассистент задач и встреч. Ссылка на готовое решение на сайте: http://95.174.93.114:8080
 
 GorkyCode — веб-приложение для управления задачами, встречами и напоминаниями на естественном русском языке. Пользователь может писать или диктовать команды, а ассистент интерпретирует запрос, при необходимости задаёт уточняющие вопросы и сохраняет результат в PostgreSQL.
 
@@ -31,6 +31,8 @@ GorkyCode — веб-приложение для управления задач
 
 Node.js, Python и PostgreSQL отдельно устанавливать не требуется — они запускаются внутри контейнеров.
 
+### Если требуется заменить датасет, то нужно заменить .csv файл на новый
+
 ### 1. Клонировать репозиторий
 
 ```bash
@@ -55,7 +57,7 @@ DATABASE_URL=postgresql://gorky:gorky-local-only@localhost:5434/gorky
 # OpenAI-compatible provider, e.g. your separately running gpt2giga.
 # host.docker.internal reaches a host service from Docker Desktop.
 LLM_BASE_URL=https://openrouter.ai/api/v1
-LLM_API_KEY=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
+LLM_API_KEY=sk-or-v1-8beb12b84368823d835a0УДАЛИТЬЭТОТТЕКСТ3b833c9c0c26ed73bd17389d2107e8ba56052a7ea6d
 LLM_MODEL=google/gemma-4-26b-a4b-it
 LLM_TIMEOUT_SECONDS=60
 # Optional bundled proxy: set LLM_BASE_URL=http://gpt2giga:8090/v1,
