@@ -38,28 +38,35 @@ git clone https://github.com/Antei22/GorkyCode_qualifying_task.git
 cd GorkyCode_qualifying_task
 ```
 
-### 2. Проверить `.env`
+### 2. Создать `.env`
 
-Файл `.env` уже находится в репозитории, поэтому создавать его вручную или копировать `.env.example` не требуется.
-
-Все необходимые переменные окружения для запуска проекта уже заданы в `.env`. Основные из них:
+Файл `.env` нужно создать в корне репозитория и заполнить следующими данными:
 
 ```dotenv
 APP_TIMEZONE=Europe/Moscow
+# Empty = real clock. Fixed ISO timestamp is only for reproducible demos/tests.
+APP_FIXED_NOW=
 FRONTEND_PORT=8080
-
 POSTGRES_USER=gorky
 POSTGRES_PASSWORD=gorky-local-only
 POSTGRES_DB=gorky
-
-LLM_BASE_URL=http://host.docker.internal:8090/v1
-LLM_API_KEY=your-api-key
-LLM_MODEL=GigaChat-3-Lightning
-LLM_EMBEDDING_MODEL=Embeddings
-SEMANTIC_SEARCH_ENABLED=1
+# Host development only; Docker overrides this with db:5432.
+DATABASE_URL=postgresql://gorky:gorky-local-only@localhost:5434/gorky
+# OpenAI-compatible provider, e.g. your separately running gpt2giga.
+# host.docker.internal reaches a host service from Docker Desktop.
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_API_KEY=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
+LLM_MODEL=google/gemma-4-26b-a4b-it
+LLM_TIMEOUT_SECONDS=60
+# Optional bundled proxy: set LLM_BASE_URL=http://gpt2giga:8090/v1,
+# supply your own keys, then start with --profile gigachat.
+GIGACHAT_CREDENTIALS=
+GIGACHAT_SCOPE=GIGACHAT_API_PERS
+FRONTEND_ORIGIN=http://localhost:8080
+COOKIE_SECURE=0
 ```
 
-`LLM_BASE_URL` должен указывать на OpenAI-compatible API с поддержкой structured/tool calling. Без настроенной модели интерфейс и база данных запустятся, но обработка команд ассистентом работать не будет.
+Без настроенной модели интерфейс и база данных запустятся, но обработка команд ассистентом работать не будет.
 
 ### 3. Запустить приложение
 
@@ -98,29 +105,6 @@ docker compose down
 
 ```bash
 docker compose down -v
-```
-
-## Запуск со встроенным GigaChat proxy
-
-В проекте есть дополнительный контейнер `gpt2giga`, который предоставляет OpenAI-compatible интерфейс для GigaChat.
-
-При использовании встроенного GigaChat proxy используются следующие параметры из уже добавленного в репозиторий `.env`:
-
-```dotenv
-LLM_BASE_URL=http://gpt2giga:8090/v1
-LLM_API_KEY=local-proxy-key
-LLM_MODEL=GigaChat-3-Lightning
-
-GIGACHAT_CREDENTIALS=your-gigachat-credentials
-GIGACHAT_SCOPE=GIGACHAT_API_PERS
-```
-
-Здесь `LLM_API_KEY` — локальный ключ защиты proxy, а `GIGACHAT_CREDENTIALS` — реальные credentials GigaChat.
-
-Запуск:
-
-```bash
-docker compose --profile gigachat up -d --build
 ```
 
 ## Архитектура
@@ -174,7 +158,7 @@ LLM не получает прямого доступа к базе данных
 | Web server | nginx |
 | Backend | Python 3.12, FastAPI, Pydantic |
 | Database | PostgreSQL 16, psycopg 3 |
-| LLM | OpenAI-compatible API / GigaChat через `gpt2giga` |
+| LLM | OpenAI-compatible API / Google-Gemma|
 | Поиск | PostgreSQL exact/substring/FTS, embeddings, LLM-reranking |
 | Голос | Browser Web Speech API, Speech Synthesis API |
 | Инфраструктура | Docker, Docker Compose |
@@ -197,7 +181,6 @@ LLM не получает прямого доступа к базе данных
 │   └── src/                         # React-приложение
 ├── data/
 │   └── voice_assistant_events_1000_77e927b5d2.csv
-├── gpt2giga/                        # optional GigaChat proxy
 ├── docker-compose.yml
 ├── .env                            # переменные окружения для запуска
 └── .env.example                    # шаблон конфигурации
