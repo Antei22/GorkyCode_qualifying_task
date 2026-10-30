@@ -7,7 +7,8 @@ export type UserDuration =
 
 export interface RecordItem {
   id: string;
-  kind: 'task' | 'meeting' | 'reminder' | null;
+  kind: 'task' | 'meeting' | 'reminder';
+  kind_source: string;
   text: string;
   scheduled_date: string | null;
   scheduled_end_date: string | null;

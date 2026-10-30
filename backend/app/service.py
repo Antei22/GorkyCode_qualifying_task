@@ -129,6 +129,11 @@ class Service:
                 resolver=resolver, planner=planner, policy=policy, executor=executor,
             )
             outcome = coordinator.handle(context, pending)
+            if outcome.execution is not None and outcome.execution.records:
+                record = outcome.execution.records[0]
+                self.repo.set_last_referenced(
+                    con, owner, record.id, record.kind,
+                )
             state_payload = dump_pending(outcome.pending) if outcome.pending else None
             context.trace.update({
                 'pending_after': state_payload,
@@ -156,6 +161,12 @@ class Service:
                 ],
                 'records': records,
                 'pending': state_payload,
+                'list_meta': {
+                    'total_count': outcome.total_count,
+                    'returned_count': len(outcome.records),
+                    'has_more': outcome.has_more,
+                    'next_cursor': outcome.next_cursor,
+                } if outcome.total_count is not None else None,
             })
             self.repo.remember(con, owner, 'user', message)
             self.repo.remember(con, owner, 'assistant', answer)
@@ -176,7 +187,8 @@ class Service:
                 item.scheduled_date, item.scheduled_time,
             ) + timedelta(minutes=item.duration.minutes)
         return {
-            'id': item.id, 'kind': item.kind, 'text': item.text,
+            'id': item.id, 'kind': item.kind, 'kind_source': item.kind_source,
+            'text': item.text,
             'scheduled_date': item.scheduled_date,
             'scheduled_end_date': item.scheduled_end_date,
             'scheduled_time': item.scheduled_time,
@@ -378,7 +390,6 @@ class Service:
                 if tools.response_mode != 'read' or not answer or not answer.strip():
                     answer = ('Найдены записи:\n' + '\n'.join(
                         f"• {r['text']} — {r['scheduled_date'] or 'без даты'} {r['scheduled_time'] or ''}"
-                        + (' (тип в исходных данных не указан)' if r['kind'] is None else '')
                         for r in rows)) if rows else 'По запросу записей не найдено.'
                     if len(rows) >= tools.result_limit:
                         answer += '\nВыдача ограничена. Уточните запрос для более точного результата.'
@@ -387,7 +398,7 @@ class Service:
                 answer = ('Я могу создать задачу, встречу или напоминание, показать расписание '
                           'и найти старую запись. Уточните, что нужно сделать.')
             response = jsonable_encoder({'answer': answer,
-                'sources': [{'type': r['kind'] or 'import', 'title': str(r['id']),
+                'sources': [{'type': r['kind'], 'title': str(r['id']),
                              'evidence': f"{r['text']} — {r['scheduled_date']} {r['scheduled_time'] or ''}"}
                             for r in list(tools.found.values())[:20]],
                 'records': tools.created or tools.cancelled or tools.updated or list(tools.found.values()),

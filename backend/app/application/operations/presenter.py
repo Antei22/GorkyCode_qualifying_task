@@ -36,10 +36,19 @@ class DefaultOutcomePresenter:
             return (f'{label}: «{record.text}»{self._when(record)}.'
                     f'{self._saved_duration(record)}')
         if not outcome.records:
+            person = context.trace.get('person_filter')
+            if person:
+                label = context.trace.get('person_label') or person.capitalize()
+                return f'Подходящих записей с {label} не найдено.'
             return 'Подходящих записей не найдено.'
         if 'duration' in outcome.read_fields:
             return '\n'.join(self._duration_line(item, context) for item in outcome.records)
-        return self._record_lines(outcome.records)
+        lines = self._record_lines(outcome.records)
+        if outcome.total_count is not None and outcome.total_count > len(outcome.records):
+            return (f'Найдено {outcome.total_count} записей. '
+                    f'Показываю первые {len(outcome.records)}:\n{lines}\n'
+                    'Показать ещё можно отдельным запросом.')
+        return lines
 
     def _record_lines(self, records):
         lines = [f'{index}. {item.text}{self._when(item)}'

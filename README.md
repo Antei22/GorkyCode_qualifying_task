@@ -142,7 +142,7 @@ docker compose logs -f gpt2giga backend
   о новых пересечениях, если они появились. Неоднозначная встреча требует уточнения.
 - `get_meeting_duration` учитывает время запроса: «будет длиться» ищет предстоящие
   встречи, «длилась» — прошедшие, конкретная дата сужает поиск до этого дня.
-  Импортированные названия встреч доступны для чтения без присвоения им типа;
+  Импортированные встречи доступны для чтения по структурному типу `meeting`;
   связанные задачи «Отправить итоги встречи» в эту выдачу не входят.
 - `blocking_duration_source` различает `user_exact`, `user_approximate`,
   `user_range_max`, `qualitative_default`, `event_type_default` и
@@ -154,7 +154,9 @@ docker compose logs -f gpt2giga backend
   прежний результат, другой текст с тем же id отвергается.
 - Изоляция записей по случайной cookie-сессии, блокировка конкурирующих реплик
   одной сессии. Это ещё не полноценная авторизация нескольких пользователей.
-- CSV-импорт без LLM, транзакционно и без повторов по идентификатору источника.
+- CSV-импорт транзакционно классифицирует kind до INSERT: strong rules, затем
+  constrained semantic classifier и обязательный fallback `task`; повторов по
+  идентификатору источника нет.
 - Гибридный поиск: exact/substring/русский PostgreSQL FTS, затем embeddings fallback
   и ограниченный LLM reranking только среди реальных строк БД. Неуверенный выбор
   приводит к уточнению, а не к придуманному ID. Каждый operation-поиск сохраняет
@@ -199,7 +201,7 @@ PostgreSQL resolver/executor, общий planner, календарная policy,
 `version`. Старый tool-loop используется только для завершения legacy-черновика,
 который существовал до миграции; новые реплики не проходят через два исполнителя.
 Подробности описаны в [архитектуре операций](backend/app/application/operations/README.md).
-Проверены 163 backend-сценария: автономный прогон и PostgreSQL-регрессии на
+Проверены 170 backend-сценариев: автономный прогон и PostgreSQL-регрессии на
 отдельной БД `gorky_regression`; frontend build/lint также проходят. Реальный
 semantic fallback зависит от поддержки `/embeddings` настроенным провайдером.
 
@@ -252,12 +254,12 @@ Pending хранит исходную цитату и допустимые зн�
 «Отмена» очищает операцию, но не отменяет сохранённую запись. Update/cancel требуют
 подтверждения, связанного с fingerprint и текущей версией записи.
 
-Основная запись: `id`, `owner_id`, `kind`, `text`,
+Основная запись: `id`, `owner_id`, `kind`, `kind_source`, `text`,
 `scheduled_date`, `scheduled_time`, `user_duration`, `duration_status`, `duration_minutes`,
 `blocking_duration_source`, совместимые `duration_source`/`duration_description`,
 `timezone`, `created_at`,
 `updated_at`, `status`, `source`, `source_id`, `raw_payload`.
-Время/дата nullable для задач без срока, `kind` nullable для неразмеченного импорта.
+Время/дата nullable для задач без срока; `kind` и `kind_source` обязательны.
 Миграции применяются автоматически при старте API, под advisory lock.
 
 Хранилище интерфейса не является источником истины: история и ожидающий
@@ -302,7 +304,10 @@ Pending хранит исходную цитату и допустимые зн�
 Это начальные записи, не размеченные пользовательские команды: в CSV нет типа,
 длительности, пояса, времени создания, аудио или ожидаемых ответов.
 Одинаковые названия в разные даты сохраняются. Исходный текст не исправляется,
-тип не угадывается: импортируется `kind=null`. Дата создания означает момент
+до INSERT классифицируется как `meeting`, `task` или `reminder`. Сначала работают
+структурные правила, затем constrained semantic classifier; при ошибке используется
+fallback `task`. `kind_source` показывает `import_rule`,
+`import_semantic_classifier` или `import_fallback`. Дата создания означает момент
 импорта. Пояс задаётся `APP_TIMEZONE`, по умолчанию Europe/Moscow.
 Повторный импорт пропускает существующий source id и не обновляет изменённую строку;
 изменённый источник потребует отдельной явной процедуры обновления.
@@ -471,13 +476,14 @@ docker compose exec -e TEST_DATABASE_URL=postgresql://gorky:gorky-local-only@db:
 Тесты не расходуют API модели: используют заглушку gateway или ассистента.
 
 Проверено в этой итерации:
-- Автономный прогон: 163 теста, 120 выполнены и 43 PostgreSQL-сценария пропущены
+- Автономный прогон: 170 тестов, 127 выполнены и 43 PostgreSQL-сценария пропущены
   без `TEST_DATABASE_URL`. PostgreSQL-модули отдельно прошли на
   `gorky_regression`: 46 тестов.
   Проверены structured user duration, безопасная верхняя граница range,
   event-type default, search trace, очищенный target, constrained reranking,
-  multi-field patch, semantic kind candidates, explicit reminder guard и
-  понятное подтверждение конфликтующих пользовательских даты/времени.
+  multi-field patch, semantic kind candidates, explicit reminder guard,
+  обязательную import-kind классификацию и понятное подтверждение конфликтующих
+  пользовательских даты/времени.
 - `compileall`, `git diff --check`, frontend production build и lint прошли.
 - Миграции `005_duration_and_search.sql`, `006_range_blocking_backfill.sql` и
   `007_duration_status.sql`
@@ -486,6 +492,9 @@ docker compose exec -e TEST_DATABASE_URL=postgresql://gorky:gorky-local-only@db:
 - Миграция `004_unified_operations.sql` применена в локальном контейнере. Реальная
   настроенная LLM через HTTP создала задачу, предложила подтверждение переименования
   и обновила ту же запись с `version 1 → 2`; временные smoke-данные удалены.
+- Миграция `009_import_kind_classification.sql` backfill-ит старые `kind IS NULL`,
+  добавляет `kind_source` и включает `NOT NULL`/CHECK. Реальный импорт 1000 строк:
+  meeting=275, task=672, reminder=53, fallback=0, null=0.
 - Frontend production build и lint прошли; backend и PostgreSQL healthy.
 - Контейнерный smoke с реальной LLM проверил `хз` без словарного перехвата,
   неизвестные дату и время, последующую замену конкретным значением и защиту уже
@@ -846,7 +855,8 @@ semantic search. UPDATE хранит отдельно target и уже норм�
 В `need_confirmation` общий LLM parser не вызывается: state-owned
 `ConfirmationResolver` принимает только явные ответы текущей реплики. Любой другой
 текст оставляет pending неизменным. Миграция `008_temporal_ranges.sql` добавляет
-конечную дату диапазона без изменения существующих записей.
+конечную дату диапазона, а `009_import_kind_classification.sql` гарантирует
+обязательный kind и источник классификации.
 
 Финальные образы собраны и запущены. frontend, backend и db имеют статус healthy.
 UI на http://localhost:8080 и /api/health отвечают HTTP 200.

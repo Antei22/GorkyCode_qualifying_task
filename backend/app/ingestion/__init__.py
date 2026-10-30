@@ -1,1 +1,1 @@
-"""CSV ingestion without LLM calls or executable instructions."""
+"""CSV ingestion with constrained classification and no executable instructions."""

@@ -17,6 +17,7 @@ from app.config import Settings
 from app.domain.models import DomainError, Kind
 from app.domain.time import Clock, period_bounds
 from app.ingestion.csv_import import import_csv
+from app.ingestion.kind_classifier import SemanticImportKindClassifier
 from app.service import Service
 from app.storage.repository import Repository
 
@@ -39,6 +40,7 @@ def create_app(settings=None, repository=None, assistant=None, operation_interpr
     if interpreter is None and assistant is None and settings.unified_operations:
         interpreter = LLMOperationInterpreter(settings)
     hybrid_search = HybridSearch(settings)
+    import_kind_classifier = SemanticImportKindClassifier(settings)
     service = Service(repo, assistant or Assistant(settings), clock,
                       operation_interpreter=interpreter,
                       hybrid_search=hybrid_search)
@@ -132,7 +134,10 @@ def create_app(settings=None, repository=None, assistant=None, operation_interpr
     @app.post('/api/import/demo')
     def demo(request: Request, response: Response):
         uid = owner(request, response)
-        return import_csv(repo, uid, DATA, settings.timezone)
+        return import_csv(
+            repo, uid, DATA, settings.timezone,
+            semantic_classifier=import_kind_classifier,
+        )
 
     return app
 

@@ -71,7 +71,7 @@ class UpdateMeetingDuration(Arguments):
 
 
 class ListRecords(Arguments):
-    """Показать записи за период. kind=null включает импорт с неизвестным типом."""
+    """Показать записи за период. Без kind возвращаются все три типа."""
     period: Literal['today', 'tomorrow', 'day_after_tomorrow', 'this_week', 'next_week', 'all', 'custom']
     kind: Kind | None = None
     date_from: str = ''
@@ -80,8 +80,6 @@ class ListRecords(Arguments):
 
 class SearchRecords(Arguments):
     """Поиск в том числе в прошлом. Короткая смысловая фраза, не полная команда.
-
-    Импорт не размечен: для него kind=null; объясни пользователю неизвестный тип.
     """
     query: str = Field(min_length=1, max_length=300)
     kind: Kind | None = None
@@ -390,7 +388,7 @@ class Tools:
         self.result_limit = 100
         self.found.update({str(row['id']): row for row in rows})
         return {'records': rows, 'limit': 100, 'date_from': first, 'date_to': last,
-                'note': 'Импортированные записи имеют неизвестный тип (kind=null).'}
+                'note': 'Импортированные записи классифицированы по kind.'}
 
     def search_records(self, args):
         rows = self.repo.search(self.con, self.owner, args.query, args.kind,

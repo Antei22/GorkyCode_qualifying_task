@@ -8,6 +8,20 @@ import type { Recognition } from './voice/browser'
 
 const labels = { task: 'Задача', meeting: 'Встреча', reminder: 'Напоминание' };
 
+function Icon({ name }: { name: 'sparkles' | 'clock' | 'calendar' | 'document' | 'upload' | 'mic' | 'send' | 'search' }) {
+  const paths = {
+    sparkles: <><path d="M12 3l1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2L12 3Z"/><path d="M5 13l.8 2.2L8 16l-2.2.8L5 19l-.8-2.2L2 16l2.2-.8L5 13Zm13 1 .7 1.8 1.8.7-1.8.7L18 19l-.7-1.8-1.8-.7 1.8-.7L18 14Z"/></>,
+    clock: <><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></>,
+    calendar: <><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M8 3v4m8-4v4M4 10h16"/></>,
+    document: <><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5M10 12h5m-5 4h5"/></>,
+    upload: <><path d="M7 18H6a4 4 0 0 1 0-8 6 6 0 0 1 11.5-1.5A4 4 0 0 1 18 18h-2"/><path d="M12 19V9m-3 3 3-3 3 3"/></>,
+    mic: <><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M6 11a6 6 0 0 0 12 0m-6 6v4m-3 0h6"/></>,
+    send: <><path d="m4 5 16 7-16 7 3-7-3-7Z"/><path d="M7 12h13"/></>,
+    search: <><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></>,
+  };
+  return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true">{paths[name]}</svg>;
+}
+
 // Единая точка превращения ошибок в понятный пользователю текст (без префиксов «Error:»).
 function errorText(reason: unknown): string {
   if (reason instanceof ApiError) return reason.message;
@@ -79,6 +93,11 @@ export default function App() {
     setVoiceName(findRussianVoice()?.name ?? '');
   }
 
+  function usePrompt(value: string) {
+    setInput(value);
+    setFromVoice(false);
+  }
+
   async function send() {
     const message = input.trim();
     if (!message || busy || !ready) return;
@@ -130,77 +149,96 @@ export default function App() {
   }
 
   return (
-    <main>
-      <header><div><p className="eyebrow">GorkyCode</p><h1>Задачи, встречи и напоминания</h1>
-        <p>Скажите или напишите, что запланировать.</p></div>
-        <button disabled={busy || !ready} onClick={() => void importDemo()}>Загрузить 1000 примеров</button>
+    <main className="app-shell">
+      <header className="hero">
+        <div className="hero__copy">
+          <p className="eyebrow">GorkyCode</p>
+          <h1>Задачи, встречи и напоминания</h1>
+          <p className="hero__subtitle">Планируйте дела, встречи и напоминания в одном месте.</p>
+        </div>
+        <div className="hero__art" aria-hidden="true"><span>31</span></div>
       </header>
-      {session && <p className="session">{session.timezone} · {new Date(session.now).toLocaleString('ru-RU', { timeZone: session.timezone })}
-        {session.fixed_clock ? ' · фиксированное время демо' : ' · время открытия страницы'}<br />Сессия: <code>{session.id}</code><br />
-        История и записи привязаны к этому браузеру. В другом браузере или после очистки cookie откроется пустая сессия.</p>}
-      {session && !session.llm_configured && <p className="notice">Для чата настройте LLM в .env. Импорт, поиск и список уже доступны.</p>}
-      {error && <p className="error" role="alert">{error}</p>}
-      {notice && <p className="notice" role="status">{notice}</p>}
-      <div className="layout">
-        <section className="panel chat" aria-label="Диалог">
-          <h2>Ассистент</h2>
-          <div className="messages" aria-live="polite">
-            {!messages.length && <p className="muted">«Напомни завтра в 10 позвонить Ивану»<br />«Что у меня на этой неделе?»<br />«Найди записи про договор»</p>}
-            {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
-            {busy && <p className="muted">Обработка…</p>}<div ref={bottom} />
+
+      <div className="status-stack">
+        {session && !session.llm_configured && <p className="notice">Для чата настройте LLM в .env. Импорт и поиск уже доступны.</p>}
+        {error && <p className="error" role="alert">{error}</p>}
+        {notice && <p className="notice" role="status">{notice}</p>}
+      </div>
+
+      <div className="workspace">
+        <section className="workspace-panel assistant-panel" aria-label="Диалог">
+          <div className="panel-heading">
+            <span className="heading-icon"><Icon name="sparkles" /></span>
+            <div><h2>Ассистент</h2><p>Поможет найти записи, запланировать задачи и напоминания.</p></div>
           </div>
-          <form onSubmit={(event) => { event.preventDefault(); void send(); }}>
-            <label htmlFor="message">Запрос или расшифровка голоса</label>
-            <textarea id="message" value={input} onChange={(event) => { setInput(event.target.value); setFromVoice(false); }}
-              maxLength={4000} placeholder="Введите запрос…" disabled={busy} readOnly={listening} />
-            {listening && <p className="recording" role="status">Идёт запись. Говорите: она остановится сама после паузы.</p>}
-            {!listening && fromVoice && input.trim() && <p className="hint" role="status">
-              Текст получен с микрофона. Проверьте его, исправьте при необходимости и нажмите «Отправить».</p>}
-            <div className="controls">
-              <button type="button" onClick={toggleRecording} aria-pressed={listening}
-                disabled={busy || !ready || !recognitionSupported()}>
-                {listening ? 'Остановить запись' : 'Микрофон'}</button>
-              <button type="submit" className="primary" disabled={busy || !ready || listening || !input.trim()}>Отправить</button>
+
+          <div className="quick-actions" aria-label="Примеры запросов">
+            <button type="button" onClick={() => usePrompt('Напомни завтра в 10 позвонить Ивану')}><Icon name="clock" /><span>Напомни завтра<br />в 10 позвонить Ивану</span></button>
+            <button type="button" onClick={() => usePrompt('Что у меня на этой неделе?')}><Icon name="calendar" /><span>Что у меня<br />на этой неделе?</span></button>
+            <button type="button" onClick={() => usePrompt('Найди записи про договор')}><Icon name="document" /><span>Найди записи<br />про договор</span></button>
+          </div>
+
+          <div className="messages" aria-live="polite">
+            {!messages.length && <div className="empty-chat"><Icon name="sparkles" /><p>Начните диалог — напишите, что нужно запланировать или найти.</p></div>}
+            {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
+            {busy && <p className="processing">Ассистент думает…</p>}<div ref={bottom} />
+          </div>
+
+          <form className="composer" onSubmit={(event) => { event.preventDefault(); void send(); }}>
+            <div className="composer__input">
+              <textarea id="message" aria-label="Запрос или расшифровка голоса" value={input}
+                onChange={(event) => { setInput(event.target.value); setFromVoice(false); }} maxLength={4000}
+                placeholder="Напишите запрос или задайте вопрос..." disabled={busy} readOnly={listening} />
+              <button type="button" className={`round-button mic-button${listening ? ' is-listening' : ''}`}
+                onClick={toggleRecording} aria-label={listening ? 'Остановить запись' : 'Включить микрофон'}
+                aria-pressed={listening} disabled={busy || !ready || !recognitionSupported()}><Icon name="mic" /></button>
+              <button type="submit" className="round-button send-button" aria-label="Отправить"
+                disabled={busy || !ready || listening || !input.trim()}><Icon name="send" /></button>
             </div>
-            <label className="checkbox"><input type="checkbox" checked={voiceAnswer}
-              onChange={(event) => setVoiceAnswer(event.target.checked)} />Озвучивать ответы</label>
-            <button type="button" className="text-button" onClick={stopSpeaking}>Остановить озвучку</button>
-            {voices.length > 1 && <>
+            {listening && <p className="recording" role="status">Идёт запись — говорите.</p>}
+            {!listening && fromVoice && input.trim() && <p className="hint">Проверьте распознанный текст перед отправкой.</p>}
+            <div className="voice-controls">
               <label htmlFor="voice">Голос озвучки</label>
-              <select id="voice" value={voiceName} onChange={(event) => chooseVoice(event.target.value)}>
+              <select id="voice" value={voiceName} onChange={(event) => chooseVoice(event.target.value)} disabled={voices.length < 2}>
+                {!voices.length && <option>Системный голос</option>}
                 {voices.map((name) => <option key={name} value={name}>{name}</option>)}
               </select>
-            </>}
-            <button type="button" className="text-button"
-              onClick={() => speak('Здравствуйте! Так звучит выбранный голос.', undefined, setNotice)}>Проверить голос</button>
-            <p className="hint">Расшифровку можно исправить перед отправкой. Распознавание зависит от браузера и сети:
-              в Chrome и Edge аудио обрабатывает сервис браузера.
-              {!recognitionSupported() && ' В этом браузере доступен только текстовый ввод.'}</p>
+              <label className="switch"><input type="checkbox" checked={voiceAnswer} onChange={(event) => setVoiceAnswer(event.target.checked)} /><span aria-hidden="true" />Озвучивать ответы</label>
+              <button type="button" className="stop-voice" onClick={stopSpeaking}>Стоп</button>
+            </div>
           </form>
         </section>
-        <section className="panel" aria-label="Сохранённые записи">
-          <h2>Сохранённые записи</h2>
+
+        <section className="workspace-panel records-panel" aria-label="Сохранённые записи">
+          <div className="records-heading">
+            <div className="panel-heading"><span className="heading-icon"><Icon name="document" /></span>
+              <div><h2>Сохранённые записи</h2><p>Просматривайте и находите все ваши задачи, встречи и заметки.</p></div>
+            </div>
+            <button className="dataset-button" disabled={busy || !ready} onClick={() => void importDemo()}><Icon name="upload" />Загрузить датасет</button>
+          </div>
+
           <form className="filters" onSubmit={(event) => { event.preventDefault(); setError(''); void loadRecords().catch((reason) => setError(errorText(reason))); }}>
-            <label htmlFor="period">Период</label>
-            <select id="period" value={period} onChange={(event) => setPeriod(event.target.value)}>
-              <option value="all">Все даты</option><option value="today">Сегодня</option>
-              <option value="tomorrow">Завтра</option><option value="this_week">Эта неделя</option>
-              <option value="next_week">Следующая неделя</option>
-            </select>
-            <label htmlFor="search">Поиск по всей истории</label>
-            <input id="search" value={query} onChange={(event) => setQuery(event.target.value)} maxLength={300} placeholder="Например, договор" />
-            <button disabled={!ready || busy}>Показать</button>
+            <div className="filter-field"><label htmlFor="period">Период</label><div className="field-with-icon"><Icon name="calendar" />
+              <select id="period" value={period} onChange={(event) => setPeriod(event.target.value)}>
+                <option value="all">Все даты</option><option value="today">Сегодня</option><option value="tomorrow">Завтра</option>
+                <option value="this_week">Эта неделя</option><option value="next_week">Следующая неделя</option>
+              </select></div></div>
+            <div className="search-field"><label htmlFor="search">Поиск по всей истории</label><div className="field-with-icon"><Icon name="search" />
+              <input id="search" value={query} onChange={(event) => setQuery(event.target.value)} maxLength={300} placeholder="Например, договор" />
+              <button className="search-button" disabled={!ready || busy}>Найти</button></div></div>
           </form>
-          <p className="hint">До 100 записей в списке, до 20 в поиске. У импорта тип не указан.
-            Фоновая доставка напоминаний пока не реализована.</p>
-          <div className="records">
-            {!records.length && <p className="muted">Записей нет. Создайте запись в чате или загрузите примеры.</p>}
-            {records.map((record) => <article className="record" key={record.id}>
-              <span className="badge">{record.kind ? labels[record.kind] : 'Импорт · тип неизвестен'}</span>
-              <h3>{record.text}</h3><p>{record.scheduled_date ?? 'Без даты'} {record.scheduled_time?.slice(0, 5) ?? ''}</p>
-              <small>{record.timezone} · {record.id.slice(0, 8)}</small>
+
+          <div className="records" tabIndex={0} aria-label="Список сохранённых записей">
+            {!records.length && <div className="empty-records"><Icon name="document" /><p>Записей пока нет.<br />Создайте их в чате или загрузите датасет.</p></div>}
+            {records.map((record) => <article className={`record record--${record.kind}`} key={record.id}>
+              <span className="record-check" aria-hidden="true" />
+              <div className="record-main"><span className="badge">{labels[record.kind]}</span><h3>{record.text}</h3>
+                <small>{record.timezone} · {record.id.slice(0, 8)}</small></div>
+              <time>{record.scheduled_date ? new Date(`${record.scheduled_date}T00:00:00`).toLocaleDateString('ru-RU', { day: '2-digit', month: 'short', year: 'numeric' }) : 'Без даты'}{record.scheduled_time ? `, ${record.scheduled_time.slice(0, 5)}` : ''}</time>
+              <button type="button" className="record-menu" aria-label={`Действия: ${record.text}`}>•••</button>
             </article>)}
           </div>
+          <p className="records-footer">Показано записей: {records.length}</p>
         </section>
       </div>
     </main>

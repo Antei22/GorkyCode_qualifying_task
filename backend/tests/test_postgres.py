@@ -440,12 +440,30 @@ class PostgresTests(unittest.TestCase):
         second = import_csv(self.repo, self.owners[0], main_module.DATA, 'Europe/Moscow')
         self.assertEqual(first['imported'], 1000)
         self.assertEqual(second['imported'], 0)
+        self.assertEqual(first['null_count'], 0)
+        self.assertEqual(
+            first['meeting_count'] + first['task_count'] + first['reminder_count'],
+            1000,
+        )
         with self.repo.connect() as con:
             count = con.execute('SELECT count(*) AS n FROM records WHERE owner_id=%s', (self.owners[0],)).fetchone()['n']
             self.assertEqual(count, 1001)
+            null_count = con.execute(
+                'SELECT count(*) AS n FROM records WHERE owner_id=%s AND kind IS NULL',
+                (self.owners[0],),
+            ).fetchone()['n']
+            self.assertEqual(null_count, 0)
             found = self.repo.search(con, self.owners[0], 'техническое задание')
             self.assertTrue(found)
-            self.assertIsNone(found[0]['kind'])
+            self.assertEqual(found[0]['kind'], 'task')
+            self.assertEqual(found[0]['kind_source'], 'import_rule')
+            columns = con.execute('''SELECT column_name,is_nullable
+                FROM information_schema.columns
+                WHERE table_name='records' AND column_name IN ('kind','kind_source')''').fetchall()
+            self.assertEqual(
+                {row['column_name']: row['is_nullable'] for row in columns},
+                {'kind': 'NO', 'kind_source': 'NO'},
+            )
 
     def test_cancel_pending_does_not_create(self):
         self.service.chat(

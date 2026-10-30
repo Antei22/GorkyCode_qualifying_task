@@ -155,14 +155,19 @@ class DurationStorageTests(unittest.TestCase):
 
     def test_imported_meeting_without_duration_is_readable_but_related_tasks_are_excluded(self):
         with self.repo.connect() as con:
-            for title in ('Встреча с Марией по аналитике', 'Отправить итоги встречи Марией'):
+            for kind, title in (
+                ('meeting', 'Встреча с Марией по аналитике'),
+                ('task', 'Отправить итоги встречи Марией'),
+            ):
                 con.execute('''INSERT INTO records
-                    (id,owner_id,text,scheduled_date,scheduled_time,timezone,source)
-                    VALUES (%s,%s,%s,%s,%s,'Europe/Moscow','csv')''',
-                    (uuid4(), self.owner, title, date(2026, 10, 24), time(9)))
+                    (id,owner_id,kind,kind_source,text,scheduled_date,scheduled_time,
+                     timezone,source)
+                    VALUES (%s,%s,%s,'import_rule',%s,%s,%s,'Europe/Moscow','csv')''',
+                    (uuid4(), self.owner, kind, title,
+                     date(2026, 10, 24), time(9)))
         response = self.chat('Сколько длилась встреча с Марией 24 октября 2026?')
         self.assertEqual(len(response['records']), 1)
-        self.assertIsNone(response['records'][0]['kind'])
+        self.assertEqual(response['records'][0]['kind'], 'meeting')
         self.assertIn('Точная длительность не указана', response['answer'])
 
     def test_ambiguous_update_does_not_change_any_record(self):

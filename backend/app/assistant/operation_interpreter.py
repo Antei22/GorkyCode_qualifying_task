@@ -9,7 +9,7 @@ from openai import OpenAI
 
 from app.domain.duration import duration_request, explicit_duration, parse_user_duration
 from app.domain.models import DomainError
-from app.domain.text import clean_title
+from app.domain.text import clean_title, extract_person_constraint
 from app.domain.time import (
     DateRange, ParsedDate, ParsedTime, PeriodDate, PeriodExpression,
     normalize_date_payload, normalize_time_payload, resolve_date,
@@ -88,6 +88,9 @@ class Proposal(BaseModel):
     target_temporal: str | ParsedDate = 'unspecified'
     target_date: ParsedDate | None = None
     target_time: ParsedTime | None = None
+    result_limit: int | None = Field(default=None, ge=1, le=100)
+    time_scope: Literal['future', 'past', 'any'] = 'any'
+    ordering_direction: Literal['asc', 'desc'] = 'asc'
     kind: str | None = None
     semantic_class: Literal[
         'meeting_like', 'todo_like', 'reminder_like', 'info_query',
@@ -198,6 +201,9 @@ mode:whole|until_end|from_start,evidence}. Диапазон дат возвра�
 temporal={type:date_range,start:{type:month_day,...},end:{type:month_day,...},evidence}.
 Для LIST заполняй target_kinds: встречи=[meeting], задачи=[task],
 напоминания=[reminder]; «что запланировано» не ограничивает тип.
+Извлекай result_limit для явного количества («5», «пять», «две»), time_scope=
+future для «ближайшие», past для «последние», иначе any. ordering_direction=
+asc для ближайших/первых и desc для последних. Без явного количества result_limit=null.
 Время возвращай как {type:absolute, hour, minute, evidence}. Если пользователь
 назвал только час, minute=0. Не ищи минуты среди соседних чисел. Числа внутри
 даты нельзя повторно использовать как час, минуты, длительность или другое поле.
@@ -342,11 +348,13 @@ class LLMOperationInterpreter:
             proposal = self._parse_proposal(calls[0].function.arguments)
         except (ValueError, TypeError, ValidationError) as error:
             raise DomainError('Модель вернула некорректный разбор операции.') from error
+        llm_proposal = proposal
         proposal = self._guard_current_temporal(context.message, proposal)
         proposal = self._guard_patch_evidence(context.message, proposal)
         proposal = self._normalize_list_action(context.message, proposal)
         proposal = self._normalize_action_fields(proposal, pending)
         proposal = self._normalize_pending_answer(context.message, pending, proposal)
+        proposal = self._apply_expected_duration(context.message, pending, proposal)
         ambiguous_fields = ()
         ambiguity_values = {}
         ambiguity_evidence = None
@@ -414,6 +422,22 @@ class LLMOperationInterpreter:
                 target_values['time_expression'] = resolve_time(
                     proposal.target_time,
                 ).isoformat(timespec='minutes')
+            if proposal.result_limit is not None:
+                target_values['result_limit'] = proposal.result_limit
+            if proposal.time_scope != 'any':
+                target_values['time_scope'] = proposal.time_scope
+            if proposal.ordering_direction != 'asc':
+                target_values['ordering_direction'] = proposal.ordering_direction
+            effective_action = (pending.intent.action if proposal.action == Action.UNKNOWN
+                                and pending is not None else proposal.action)
+            if effective_action in (Action.READ, Action.LIST, Action.UPDATE,
+                                    Action.CANCEL):
+                person = extract_person_constraint(context.message)
+                if person:
+                    target_values['person'] = person
+                    label = re.search(r'\bс\s+([А-ЯЁ][а-яё-]+)\b', context.message)
+                    if label:
+                        target_values['person_label'] = label.group(1)
             target = TargetQuery(**target_values)
             change_date = proposal.temporal or proposal.date
             change_values = {key: value for key, value in {
@@ -502,7 +526,26 @@ class LLMOperationInterpreter:
             },
             'target_kinds': list(intent.target.kinds),
             'target_query': intent.target.query,
+            'person_filter': intent.target.person,
+            'person_label': intent.target.person_label,
+            'result_limit': intent.target.result_limit,
+            'time_scope': intent.target.time_scope,
+            'ordering_direction': intent.target.ordering_direction,
             'patch': intent.changes.model_dump(mode='json', exclude_unset=True),
+            'expected_field': self._expected_field(pending),
+            'detected_evidence': {
+                'date': self._date_phrases(context.message),
+                'time': self._time_phrases(context.message),
+            },
+            'accepted_patch': intent.changes.model_dump(
+                mode='json', exclude_unset=True,
+            ),
+            'dropped_patch_fields': [
+                field for field in ('text', 'date', 'temporal', 'time', 'target_date',
+                                    'target_time', 'timezone', 'kind')
+                if getattr(llm_proposal, field) is not None
+                and getattr(proposal, field) is None
+            ],
         })
         return result
 
@@ -766,6 +809,25 @@ class LLMOperationInterpreter:
                 updates['duration_minutes'] = None
         return proposal.model_copy(update=updates) if updates else proposal
 
+    @classmethod
+    def _apply_expected_duration(cls, message, pending, proposal):
+        """A duration clarification is parsed from raw text before LLM fallback."""
+        if cls._expected_field(pending) != 'duration':
+            return proposal
+        parsed = parse_user_duration(message)
+        if parsed is None:
+            return proposal
+        return proposal.model_copy(update={
+            'turn': TurnKind.CONTINUE,
+            'action': Action.UNKNOWN,
+            'user_duration': DurationInput.model_validate(parsed),
+            'duration_minutes': None,
+            'duration_description': None,
+            'unknown_fields': tuple(
+                field for field in proposal.unknown_fields if field != 'duration'
+            ),
+        })
+
     @staticmethod
     def _duration_input(proposal):
         if proposal.user_duration is not None:
@@ -804,18 +866,28 @@ class LLMOperationInterpreter:
         updates = {}
         for field in ('date', 'temporal', 'target_date', 'time', 'target_time'):
             value = getattr(proposal, field)
-            if value is not None and value.evidence and not cls._evidence_present(
-                    context.message, value.evidence):
-                updates[field] = None
-            elif value is not None and field in {'date', 'temporal', 'target_date'}:
+            if value is not None:
+                evidence = getattr(value, 'evidence', None)
+                has_evidence = (
+                    cls._evidence_present(context.message, evidence)
+                    if evidence else
+                    bool(cls._time_phrases(context.message))
+                    if field in {'time', 'target_time'} else
+                    bool(cls._date_phrases(context.message))
+                )
+                if not has_evidence:
+                    updates[field] = None
+                    continue
+            if value is not None and field in {'date', 'temporal', 'target_date'}:
                 try:
                     resolve_temporal(value, context.now)
                 except (DomainError, ValueError, OverflowError):
                     updates[field] = None
         if not isinstance(proposal.target_temporal, str):
             value = proposal.target_temporal
-            if (value.evidence and not cls._evidence_present(
-                    context.message, value.evidence)):
+            evidence = getattr(value, 'evidence', None)
+            if not (cls._evidence_present(context.message, evidence)
+                    if evidence else cls._date_phrases(context.message)):
                 updates['target_temporal'] = 'unspecified'
             else:
                 try:
@@ -823,6 +895,15 @@ class LLMOperationInterpreter:
                 except (DomainError, ValueError, OverflowError):
                     updates['target_temporal'] = 'unspecified'
         return proposal.model_copy(update=updates) if updates else proposal
+
+    @staticmethod
+    def _time_phrases(message):
+        value = message.lower().replace('ё', 'е')
+        return tuple(match.group(0) for match in re.finditer(
+            r'\b(?:[01]?\d|2[0-3]):[0-5]\d\b|'
+            r'\b(?:в|на)\s+(?:[01]?\d|2[0-3])(?:\s*(?:утра|дня|вечера|ночи))?\b',
+            value,
+        ))
 
     @staticmethod
     def _date_phrases(message):
@@ -954,6 +1035,31 @@ class LLMOperationInterpreter:
             r'\b(?:есть ли|какие|что запланировано|что у меня)\b', value,
         ))
         updates = {'target_kinds': tuple(kinds)} if kinds else {}
+        number_words = {'один': 1, 'одна': 1, 'одно': 1, 'два': 2,
+                        'две': 2, 'три': 3, 'четыре': 4, 'пять': 5,
+                        'шесть': 6, 'семь': 7, 'восемь': 8, 'девять': 9,
+                        'десять': 10}
+        quantity = re.search(
+            r'\b(\d{1,3}|один|одна|одно|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\b',
+            value,
+        )
+        quantity_requested = bool(re.search(
+            r'\b(?:первые|последние|ближайшие|выведи|выведите|покажи|покажите)\s+'
+            r'(?:\d{1,3}|один|одна|одно|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\b',
+            value,
+        ))
+        if quantity and quantity_requested:
+            raw = quantity.group(1)
+            updates['result_limit'] = min(100, max(1, int(raw) if raw.isdigit()
+                                                    else number_words[raw]))
+            if not re.search(r'\b(?:последн\w*|прошл\w*)\b', value):
+                updates.update({'time_scope': 'future', 'ordering_direction': 'asc'})
+        if re.search(r'\b(?:ближайш\w*|первых)\b', value):
+            updates.update({'time_scope': 'future', 'ordering_direction': 'asc'})
+        elif re.search(r'\bпоследн\w*\b', value):
+            updates.update({'time_scope': 'past', 'ordering_direction': 'desc'})
+        elif proposal.action in {Action.READ, Action.LIST}:
+            updates.setdefault('time_scope', 'any')
         if proposal.action == Action.READ and broad:
             updates.update({'action': Action.LIST, 'target_query': None})
         return proposal.model_copy(update=updates) if updates else proposal

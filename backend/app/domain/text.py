@@ -6,6 +6,29 @@ import re
 
 logger = logging.getLogger(__name__)
 
+_PERSON_ALIASES = {
+    'даша': 'дарь', 'даш': 'дарь', 'дарья': 'дарь',
+    'саша': 'александр', 'саш': 'александр', 'александр': 'александр', 'александра': 'александр',
+    'миша': 'михаил', 'михаил': 'михаил',
+}
+
+
+def normalize_person(value: str) -> str:
+    """Small, controlled Russian-name normalizer for a structural search filter."""
+    value = value.lower().replace('ё', 'е').strip(' .,!?')
+    value = re.sub(r'(?:ами|ями|ого|ему|ому|ой|ей|ую|юю|ом|ем|ах|ях|а|я|у|ю|ы|и|е)$', '', value)
+    return _PERSON_ALIASES.get(value, value)
+
+
+def extract_person_constraint(raw_text: str) -> str | None:
+    match = re.search(r'\bс\s+([А-ЯЁ][а-яё-]+)\b', raw_text)
+    return normalize_person(match.group(1)) if match else None
+
+
+def person_matches(person: str, canonical_text: str) -> bool:
+    names = re.findall(r'\b(?:с|у)\s+([А-ЯЁ][а-яё-]+)\b', canonical_text)
+    return any(normalize_person(name) == person for name in names)
+
 
 def _remove_fragment(value: str, fragment: str) -> str:
     if not fragment.strip():
@@ -54,6 +77,11 @@ def clean_title(text: str | None, raw_text: str,
     )
     value = re.sub(r'[,;:]?\s*его\s+на\b.*$', ' ', value, flags=re.IGNORECASE)
     value = re.sub(r'\b(на|в)\s+\1\b', r'\1', value, flags=re.IGNORECASE)
+    # A temporal fragment can leave its leading preposition behind: for example
+    # "на завтра с подругой" -> "на с подругой".  It is parser scaffolding,
+    # never record content.
+    value = re.sub(r'^\s*(?:на\s+)+(?:с\s+)', 'с ', value,
+                   flags=re.IGNORECASE)
     value = re.sub(r'\s+', ' ', value).strip(' ,.-')
     value = re.sub(r'\s+(?:на|в|до)$', '', value, flags=re.IGNORECASE).strip(' ,.-')
 
@@ -63,4 +91,13 @@ def clean_title(text: str | None, raw_text: str,
         'temporal_evidence': list(evidence),
         'cleaned_text': value,
     }, ensure_ascii=False))
+    return value
+
+
+def build_canonical_text(kind: str | None, text: str | None, raw_text: str,
+                         temporal_evidence=()) -> str:
+    """Return the sole human-readable title persisted and indexed for a record."""
+    value = clean_title(text, raw_text, temporal_evidence)
+    if kind == 'meeting' and re.match(r'^с\s+', value, flags=re.IGNORECASE):
+        value = f'встреча {value}'
     return value

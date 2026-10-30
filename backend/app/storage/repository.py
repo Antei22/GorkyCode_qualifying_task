@@ -37,9 +37,9 @@ class Repository:
     def create(con, owner, draft, source='chat', source_id=None, raw=None):
         fields = draft.model_dump()
         return con.execute('''INSERT INTO records
-            (id,owner_id,kind,text,scheduled_date,scheduled_end_date,scheduled_time,duration_minutes,duration_source,duration_description,user_duration,duration_status,blocking_duration_source,timezone,source,source_id,raw_payload)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
-            (uuid4(), owner, fields['kind'], fields['text'], fields['scheduled_date'],
+            (id,owner_id,kind,kind_source,text,scheduled_date,scheduled_end_date,scheduled_time,duration_minutes,duration_source,duration_description,user_duration,duration_status,blocking_duration_source,timezone,source,source_id,raw_payload)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+            (uuid4(), owner, fields['kind'], fields['kind_source'], fields['text'], fields['scheduled_date'],
              fields['scheduled_end_date'], fields['scheduled_time'], fields['duration_minutes'], fields['duration_source'],
              fields['duration_description'], Jsonb(fields['user_duration']) if fields['user_duration'] else None,
              fields['duration_status'], fields['blocking_duration_source'], fields['timezone'],
@@ -49,12 +49,12 @@ class Repository:
     def create_with_id(con, owner, record_id, draft, source='chat'):
         fields = draft.model_dump()
         return con.execute('''INSERT INTO records
-            (id,owner_id,kind,text,scheduled_date,scheduled_end_date,scheduled_time,duration_minutes,
+            (id,owner_id,kind,kind_source,text,scheduled_date,scheduled_end_date,scheduled_time,duration_minutes,
              duration_source,duration_description,user_duration,blocking_duration_source,
              duration_status,timezone,source,raw_payload)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
             RETURNING *''',
-            (record_id, owner, fields['kind'], fields['text'],
+            (record_id, owner, fields['kind'], fields['kind_source'], fields['text'],
              fields['scheduled_date'], fields['scheduled_end_date'], fields['scheduled_time'],
              fields['duration_minutes'], fields['duration_source'],
              fields['duration_description'],
@@ -67,6 +67,21 @@ class Repository:
         return con.execute('''SELECT * FROM records
             WHERE owner_id=%s AND id=%s AND status <> 'cancelled' ''',
             (owner, record_id)).fetchone()
+
+    @staticmethod
+    def set_last_referenced(con, owner, record_id, kind):
+        con.execute('''UPDATE sessions
+            SET last_referenced_record_id=%s, last_referenced_kind=%s
+            WHERE id=%s''', (record_id, kind, owner))
+
+    @staticmethod
+    def get_last_referenced(con, owner, kind=None):
+        return con.execute('''SELECT records.* FROM sessions
+            JOIN records ON records.id=sessions.last_referenced_record_id
+            WHERE sessions.id=%s AND records.owner_id=%s
+              AND records.status <> 'cancelled'
+              AND (%s::text IS NULL OR records.kind=%s)''',
+            (owner, owner, kind, kind)).fetchone()
 
     @staticmethod
     def resolve_records(con, owner, query=None, kind=None, temporal='unspecified',
@@ -106,14 +121,14 @@ class Repository:
     @staticmethod
     def update_record(con, owner, record_id, expected_version, draft):
         fields = draft.model_dump()
-        return con.execute('''UPDATE records SET kind=%s, text=%s,
+        return con.execute('''UPDATE records SET kind=%s, kind_source=%s, text=%s,
             scheduled_date=%s, scheduled_end_date=%s, scheduled_time=%s, duration_minutes=%s,
             duration_source=%s, duration_description=%s, user_duration=%s,
             duration_status=%s, blocking_duration_source=%s, timezone=%s,
             version=version+1, updated_at=now()
             WHERE owner_id=%s AND id=%s AND version=%s AND status='open'
             RETURNING *''',
-            (fields['kind'], fields['text'], fields['scheduled_date'],
+            (fields['kind'], fields['kind_source'], fields['text'], fields['scheduled_date'],
              fields['scheduled_end_date'], fields['scheduled_time'], fields['duration_minutes'],
              fields['duration_source'], fields['duration_description'],
              Jsonb(fields['user_duration']) if fields['user_duration'] else None,
@@ -143,10 +158,10 @@ class Repository:
 
     @staticmethod
     def list_records(con, owner, first=None, last=None, kind=None, limit=100,
-                     now=None, kinds=None):
+                     now=None, kinds=None, temporal='all', order_direction='asc'):
         now = now or datetime.now()
         today, current_time = now.date(), now.time().replace(tzinfo=None)
-        return con.execute('''SELECT records.*,
+        rows = con.execute('''SELECT records.*,
             duration_minutes AS blocking_duration_minutes,
             CASE WHEN scheduled_date IS NOT NULL AND scheduled_time IS NOT NULL
                       AND duration_minutes IS NOT NULL
@@ -173,6 +188,26 @@ class Repository:
              today, today, current_time, today, today, current_time,
              today, today, current_time, today, today, current_time,
              today, today, current_time, limit)).fetchall()
+        if temporal == 'future':
+            rows = [row for row in rows if (
+                row['scheduled_date'] is None
+                or row['scheduled_date'] > today
+                or (row['scheduled_date'] == today and
+                    (row['scheduled_time'] is None or row['scheduled_time'] >= current_time))
+            )]
+        elif temporal == 'past':
+            rows = [row for row in rows if row['scheduled_date'] is not None and (
+                row['scheduled_date'] < today
+                or (row['scheduled_date'] == today and row['scheduled_time'] is not None
+                    and row['scheduled_time'] < current_time)
+            )]
+        rows.sort(key=lambda row: (
+            row['scheduled_date'] is None,
+            row['scheduled_date'] or today,
+            row['scheduled_time'] or current_time,
+            row['id'],
+        ), reverse=order_direction == 'desc')
+        return rows[:limit]
 
     @staticmethod
     def search(con, owner, query, kind=None, limit=20, now=None, future_only=False):

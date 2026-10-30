@@ -8,6 +8,11 @@ Kind = Literal['task', 'meeting', 'reminder']
 class RecordDraft(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     kind: Kind
+    kind_source: Literal[
+        'import_rule', 'import_semantic_classifier', 'import_fallback',
+        'user_input', 'explicit_user_command', 'explicit_entity_word',
+        'semantic_inference', 'user_clarification', 'system_default',
+    ] = 'user_input'
     text: str = Field(min_length=1, max_length=1000)
     scheduled_date: date | None = None
     scheduled_end_date: date | None = None

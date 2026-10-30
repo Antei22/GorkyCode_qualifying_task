@@ -196,6 +196,9 @@ class OperationCoordinator:
                 phase=Phase.COMPLETED,
                 records=resolution.candidates,
                 read_fields=intent.read_fields,
+                total_count=resolution.total_count,
+                has_more=resolution.has_more,
+                next_cursor=resolution.next_cursor,
             )
 
         selected_id = (interpretation.selected_candidate_id

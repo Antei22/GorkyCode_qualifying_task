@@ -110,7 +110,10 @@ Planner формирует полный `before/after`, а `make_change_plan` с
 `blocking_source` объясняет каждое решение. Плановая оценка не становится
 фактической длительностью после наступления даты. Presenter показывает пользовательскую
 точность и отдельно сообщает технический резерв, когда точного значения нет.
-Импортированная запись сохраняет `kind=None`, пока тип явно не определён.
+Импорт работает в отдельном non-interactive режиме: strong rules → constrained
+semantic classifier → forced fallback `task`. До INSERT каждая запись получает
+один kind и `kind_source`; migration 009 backfill-ит старые NULL и запрещает их
+через `NOT NULL` и CHECK constraint.
 
 `duration_status` независимо хранит состояние диалога: `missing` требует вопроса,
 `provided` означает пользовательское значение, `declined_to_specify` фиксирует

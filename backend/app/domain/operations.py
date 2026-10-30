@@ -26,7 +26,8 @@ SemanticClass = Literal[
 ValueSource = Literal['user_input', 'system_default', 'derived']
 KindSource = Literal[
     'explicit_user_command', 'explicit_entity_word', 'semantic_inference',
-    'user_clarification', 'system_default',
+    'user_clarification', 'system_default', 'user_input',
+    'import_rule', 'import_semantic_classifier', 'import_fallback',
 ]
 DurationStatus = Literal[
     'missing', 'provided', 'declined_to_specify', 'defaulted',
@@ -133,6 +134,12 @@ class TargetQuery(Contract):
     temporal: Literal['future', 'past', 'all', 'unspecified'] | ParsedDate = 'unspecified'
     date_expression: str | None = None
     time_expression: str | None = None
+    # Structural person constraint; never substitute an unrelated semantic hit.
+    person: str | None = None
+    person_label: str | None = None
+    result_limit: int | None = Field(default=None, ge=1, le=100)
+    time_scope: Literal['future', 'past', 'any'] = 'any'
+    ordering_direction: Literal['asc', 'desc'] = 'asc'
 
 
 class OperationIntent(Contract):
@@ -174,8 +181,9 @@ class Interpretation(Contract):
 
 class RecordSnapshot(Contract):
     id: UUID
-    # Imported records stay untyped until a separate explicit decision.
+    # A transient create draft may start without a kind; persisted records may not.
     kind: Kind | None
+    kind_source: KindSource = 'user_input'
     text: str
     scheduled_date: date | None
     scheduled_end_date: date | None = None
@@ -191,6 +199,9 @@ class RecordSnapshot(Contract):
 class TargetResolution(Contract):
     candidates: tuple[RecordSnapshot, ...] = ()
     truncated: bool = False
+    total_count: int | None = None
+    has_more: bool = False
+    next_cursor: str | None = None
 
 
 class ChangePlan(Contract):
@@ -291,6 +302,9 @@ class OperationOutcome(Contract):
     records: tuple[RecordSnapshot, ...] = ()
     read_fields: tuple[str, ...] = ()
     execution: ExecutionResult | None = None
+    total_count: int | None = None
+    has_more: bool = False
+    next_cursor: str | None = None
 
     @model_validator(mode='after')
     def validate_result(self):

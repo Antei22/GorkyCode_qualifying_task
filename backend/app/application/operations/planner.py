@@ -10,7 +10,7 @@ from app.domain.operations import (
 )
 from datetime import date, time
 from app.domain.time import parse_day, parse_time, resolve_temporal
-from app.domain.text import clean_title
+from app.domain.text import build_canonical_text
 from .ports import TurnContext
 
 
@@ -76,13 +76,13 @@ class DefaultChangePlanner:
         if intent.action != Action.CANCEL:
             if 'kind' in supplied:
                 values['kind'] = patch.kind
+                values['kind_source'] = intent.kind_source or 'user_input'
             if 'text' in supplied:
                 evidence = tuple(intent.field_evidence.values())
-                values['text'] = (
-                    clean_title(
-                        patch.text, intent.source_text or patch.text, evidence,
-                    ) if patch.text else ''
-                )
+                values['text'] = (build_canonical_text(
+                    values.get('kind'), patch.text,
+                    intent.source_text or patch.text, evidence,
+                ) if patch.text else '')
             if 'timezone' in supplied:
                 values['timezone'] = patch.timezone or ''
             self._apply_schedule(values, patch, supplied, context)
@@ -113,6 +113,7 @@ class DefaultChangePlanner:
 
         after = RecordSnapshot.model_validate(values)
         plan = make_change_plan(intent.action.value, before, after)
+        context.trace['canonical_text'] = after.text
         context.trace['planner_result'] = plan.model_dump(mode='json')
         return plan
 
