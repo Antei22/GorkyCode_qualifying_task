@@ -42,6 +42,8 @@ class Action(str, Enum):
     CREATE = 'create'
     UPDATE = 'update'
     CANCEL = 'cancel'
+    COMPLETE = 'complete'
+    REOPEN = 'reopen'
     READ = 'read'
     LIST = 'list'
     UNKNOWN = 'unknown'
@@ -166,6 +168,7 @@ class OperationIntent(Contract):
     resolved_ambiguity: OperationField | None = None
     # Transient negotiation signal for a different proposed calendar slot.
     alternative_requested: bool = False
+    all_matches: bool = False
 
 
 class Interpretation(Contract):
@@ -206,7 +209,7 @@ class TargetResolution(Contract):
 
 class ChangePlan(Contract):
     """Server-built before/after state; update preserves identity and omitted fields."""
-    action: Literal['create', 'update', 'cancel']
+    action: Literal['create', 'update', 'cancel', 'complete', 'reopen']
     before: RecordSnapshot | None
     after: RecordSnapshot
     fingerprint: str = Field(pattern=r'^[0-9a-f]{64}$')
@@ -225,6 +228,17 @@ class ChangePlan(Contract):
             raise ValueError('create plan must produce open status')
         if self.action == 'update' and self.before.status != self.after.status:
             raise ValueError('update plan cannot change record status')
+        if self.action == 'complete':
+            if self.before.status != 'open' or self.after.status != 'done':
+                raise ValueError('complete plan must change open to done')
+        if self.action == 'reopen':
+            if self.before.status != 'done' or self.after.status != 'open':
+                raise ValueError('reopen plan must change done to open')
+        if self.action in {'complete', 'reopen'}:
+            before = self.before.model_dump(exclude={'status', 'revision'})
+            after = self.after.model_dump(exclude={'status', 'revision'})
+            if before != after:
+                raise ValueError('status action cannot change record fields')
         if self.action == 'cancel':
             before = self.before.model_dump(exclude={'status', 'revision'})
             after = self.after.model_dump(exclude={'status', 'revision'})
@@ -274,6 +288,7 @@ class PendingOperation(Contract):
     candidate_ids: tuple[UUID, ...] = ()
     selected_record_id: UUID | None = None
     proposed_plan: ChangePlan | None = None
+    proposed_batch: 'BatchChangePlan | None' = None
     confirmed_fingerprint: str | None = None
     pending_changes: tuple[PendingChange, ...] = ()
     created_at: datetime
@@ -290,7 +305,7 @@ class PendingOperation(Contract):
 
 
 class ExecutionResult(Contract):
-    action: Literal['create', 'update', 'cancel']
+    action: Literal['create', 'update', 'cancel', 'complete', 'reopen']
     records: tuple[RecordSnapshot, ...] = Field(min_length=1)
 
 
@@ -335,9 +350,27 @@ def plan_fingerprint(action: str, before: RecordSnapshot | None,
     return sha256(encoded).hexdigest()
 
 
-def make_change_plan(action: Literal['create', 'update', 'cancel'],
+def make_change_plan(action: Literal['create', 'update', 'cancel', 'complete', 'reopen'],
                      before: RecordSnapshot | None,
                      after: RecordSnapshot) -> ChangePlan:
     """Build a plan whose fingerprint cannot be supplied by the model/client."""
     return ChangePlan(action=action, before=before, after=after,
                       fingerprint=plan_fingerprint(action, before, after))
+
+
+class BatchChangePlan(Contract):
+    action: Literal['complete', 'reopen']
+    plans: tuple[ChangePlan, ...] = Field(min_length=1)
+    fingerprint: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+def batch_fingerprint(action: str, plans: tuple[ChangePlan, ...]) -> str:
+    import json
+    payload = {'action': action, 'plans': [
+        {'id': str(plan.after.id), 'fingerprint': plan.fingerprint} for plan in plans
+    ]}
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+PendingOperation.model_rebuild()

@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from openai import OpenAIError
 from psycopg import Error as DatabaseError
 from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
 from app.assistant.agent import Assistant
 from app.assistant.operation_interpreter import LLMOperationInterpreter
 from app.assistant.search import HybridSearch
@@ -30,6 +31,12 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     request_id: UUID
     message: str = Field(min_length=1, max_length=4000)
+
+
+class RecordStatusRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    status: Literal['open', 'done']
+    expected_version: int = Field(ge=1)
 
 
 def create_app(settings=None, repository=None, assistant=None, operation_interpreter=None):
@@ -53,7 +60,7 @@ def create_app(settings=None, repository=None, assistant=None, operation_interpr
     app = FastAPI(title='GorkyCode tasks and meetings API', lifespan=lifespan)
     app.state.service = service
     app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_origin],
-                       allow_credentials=True, allow_methods=['GET', 'POST'], allow_headers=['Content-Type'])
+                       allow_credentials=True, allow_methods=['GET', 'POST', 'PATCH'], allow_headers=['Content-Type'])
 
     @app.exception_handler(DomainError)
     async def input_error(request, error):
@@ -107,6 +114,16 @@ def create_app(settings=None, repository=None, assistant=None, operation_interpr
     @app.post('/api/chat')
     def chat(payload: ChatRequest, request: Request, response: Response):
         return service.chat(owner(request, response), payload.request_id, payload.message)
+
+    @app.patch('/api/records/{record_id}/status')
+    def set_record_status(record_id: UUID, payload: RecordStatusRequest,
+                           request: Request, response: Response):
+        uid = owner(request, response)
+        with repo.connect() as con:
+            row = repo.set_status(con, uid, record_id, payload.expected_version, payload.status)
+        if not row:
+            raise HTTPException(409, 'Запись уже изменилась. Обновите список и повторите действие.')
+        return {'record': row}
 
     @app.get('/api/records')
     def records(request: Request, response: Response, period: str = 'all',

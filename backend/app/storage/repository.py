@@ -85,12 +85,13 @@ class Repository:
 
     @staticmethod
     def resolve_records(con, owner, query=None, kind=None, temporal='unspecified',
-                        day=None, moment=None, now=None, limit=20):
+                        day=None, moment=None, now=None, limit=20, statuses=None):
         now = (now or datetime.now()).replace(tzinfo=None)
         query = (query or '').strip() or None
         return con.execute('''SELECT * FROM records
             WHERE owner_id=%s AND status <> 'cancelled'
             AND (%s::text IS NULL OR kind=%s)
+            AND (%s::text[] IS NULL OR status=ANY(%s::text[]))
             AND (%s::text IS NULL OR
                  to_tsvector('russian',text) @@ plainto_tsquery('russian',%s)
                  OR strpos(lower(text),lower(%s)) > 0)
@@ -114,7 +115,8 @@ class Repository:
                      THEN scheduled_time END ASC NULLS LAST,
                 scheduled_date DESC NULLS LAST, scheduled_time DESC NULLS LAST, id
             LIMIT %s''',
-            (owner, kind, kind, query, query, query, day, day, moment, moment,
+            (owner, kind, kind, list(statuses) if statuses else None,
+             list(statuses) if statuses else None, query, query, query, day, day, moment, moment,
              temporal, temporal, now, temporal, now,
              query, query, query, now, now, now, limit)).fetchall()
 
@@ -135,6 +137,26 @@ class Repository:
              fields['duration_status'], fields['blocking_duration_source'],
              fields['timezone'], owner,
              record_id, expected_version)).fetchone()
+
+    @staticmethod
+    def set_status(con, owner, record_id, expected_version, status):
+        return con.execute('''UPDATE records SET status=%s,
+            version=version+1, updated_at=now()
+            WHERE owner_id=%s AND id=%s AND version=%s AND status <> 'cancelled'
+            RETURNING *, duration_minutes AS blocking_duration_minutes,
+              CASE WHEN scheduled_date IS NOT NULL AND scheduled_time IS NOT NULL
+                    AND duration_minutes IS NOT NULL
+                   THEN scheduled_date + scheduled_time + duration_minutes * interval '1 minute'
+              END AS reserved_until''',
+            (status, owner, record_id, expected_version)).fetchone()
+
+    @staticmethod
+    def change_status_versioned(con, owner, record_id, expected_version, from_status, to_status):
+        return con.execute('''UPDATE records SET status=%s,
+            version=version+1, updated_at=now()
+            WHERE owner_id=%s AND id=%s AND version=%s AND status=%s
+            RETURNING *''',
+            (to_status, owner, record_id, expected_version, from_status)).fetchone()
 
     @staticmethod
     def trace_search(con, context, intent, query, stage, rows):

@@ -28,7 +28,8 @@ export interface RecordItem {
     | 'legacy_unknown';
   reserved_until: string | null;
   timezone: string;
-  status: string;
+  status: 'open' | 'done' | 'cancelled';
+  version: number | string;
   source: string;
 }
 

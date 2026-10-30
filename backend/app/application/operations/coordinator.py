@@ -11,6 +11,7 @@ from app.domain.models import FieldInputError
 from app.domain.operations import (
     Action, OperationIntent, OperationOutcome, PendingOperation, Phase,
     PolicyDecision, RecordPatch, TargetQuery, TurnKind, ValidationIssue,
+    BatchChangePlan, ExecutionResult, batch_fingerprint,
 )
 from .ports import (
     ChangePlanner, IntentInterpreter, OperationExecutor, OperationPolicy,
@@ -111,7 +112,8 @@ class OperationCoordinator:
         if resolved_conflict_intent is not None:
             intent = resolved_conflict_intent
         elif turn == TurnKind.CONFIRM:
-            if pending.phase != Phase.NEED_CONFIRMATION or pending.proposed_plan is None:
+            if (pending.phase != Phase.NEED_CONFIRMATION
+                    or (pending.proposed_plan is None and pending.proposed_batch is None)):
                 return self._need_intent(
                     'confirmation_not_expected',
                     'Сейчас нет изменения, ожидающего подтверждения.',
@@ -183,6 +185,26 @@ class OperationCoordinator:
             intent = interpretation.intent or OperationIntent()
             pending = None
 
+        if (turn == TurnKind.CONFIRM and pending is not None
+                and pending.proposed_batch is not None):
+            batch = pending.proposed_batch
+            if batch.fingerprint != batch_fingerprint(batch.action, batch.plans):
+                return OperationOutcome(
+                    phase=Phase.REJECTED,
+                    issues=(ValidationIssue(code='invalid_batch_fingerprint', message='Пакет изменений повреждён.'),),
+                )
+            records = []
+            for saved_plan in batch.plans:
+                execution = self.executor.execute(context, saved_plan)
+                if execution.action != saved_plan.action or len(execution.records) != 1:
+                    raise RuntimeError('operation executor returned a different batch action')
+                records.extend(execution.records)
+            executed = tuple(records)
+            return OperationOutcome(
+                phase=Phase.COMPLETED, records=executed,
+                execution=ExecutionResult(action=batch.action, records=executed),
+            )
+
         if intent.action == Action.UNKNOWN:
             decision = self.policy.evaluate(context, intent, None, pending)
             return self._from_decision(context, intent, decision, pending)
@@ -251,7 +273,9 @@ class OperationCoordinator:
                 )
                 return self._from_decision(context, intent, decision, pending)
 
-        if intent.action in (Action.UPDATE, Action.CANCEL):
+        if (intent.action in (Action.UPDATE, Action.CANCEL, Action.COMPLETE, Action.REOPEN)
+                and not (intent.action in (Action.COMPLETE, Action.REOPEN)
+                         and intent.all_matches)):
             candidates = resolution.candidates
             if selected_id is not None:
                 target = next((item for item in candidates if item.id == selected_id), None)
@@ -269,6 +293,28 @@ class OperationCoordinator:
                     context, intent, pending, (), 'target_not_found',
                     'Подходящая запись не найдена. Уточните название или дату.',
                 )
+
+        if intent.action in (Action.COMPLETE, Action.REOPEN) and intent.all_matches:
+            candidates = resolution.candidates
+            if not candidates:
+                return self._need_target(context, intent, pending, (), 'target_not_found',
+                                         'Подходящих записей не найдено. Уточните название или дату.')
+            plans = tuple(self.planner.prepare(context, intent, item) for item in candidates)
+            batch = BatchChangePlan(
+                action=intent.action.value,
+                plans=plans,
+                fingerprint=batch_fingerprint(intent.action.value, plans),
+            )
+            state = self._pending(
+                context, intent, Phase.NEED_CONFIRMATION, pending,
+                candidate_ids=tuple(item.id for item in candidates),
+                plan=None, proposed_batch=batch,
+            )
+            verb = 'выполненными' if intent.action == Action.COMPLETE else 'в активные'
+            return OperationOutcome(
+                phase=Phase.NEED_CONFIRMATION, pending=state,
+                question=f'Найдено {len(plans)} записей. Отметить {verb} все {len(plans)}?',
+            )
             if selected_id is not None:
                 context.trace['selected_id'] = str(selected_id)
             else:
@@ -379,7 +425,7 @@ class OperationCoordinator:
                                 question=decision.question, issues=decision.issues)
 
     def _pending(self, context, intent, phase, previous, candidate_ids=(),
-                 selected_id=None, plan=None, pending_changes=()):
+                 selected_id=None, plan=None, pending_changes=(), proposed_batch=None):
         created_at = previous.created_at if previous else context.now
         return PendingOperation(
             operation_id=previous.operation_id if previous else self.operation_id_factory(),
@@ -388,6 +434,7 @@ class OperationCoordinator:
             candidate_ids=tuple(candidate_ids),
             selected_record_id=selected_id,
             proposed_plan=plan,
+            proposed_batch=proposed_batch,
             pending_changes=tuple(pending_changes),
             created_at=created_at,
             updated_at=context.now,

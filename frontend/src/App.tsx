@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ApiError, apiFetch } from './api/client'
 import { MessageBubble } from './components/chat/MessageBubble'
+import { DateRangePicker, type DateRangeValue } from './components/records/DateRangePicker'
 import type { ChatMessage } from './types/chat'
 import type { AssistantResponse, RecordItem, Session } from './types/records'
 import { findRussianVoice, listRussianVoices, onVoicesChanged, recognitionSupported, setPreferredVoice, speak, startRecognition, stopSpeaking } from './voice/browser'
@@ -34,8 +35,7 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [records, setRecords] = useState<RecordItem[]>([]);
   const [input, setInput] = useState('');
-  const [query, setQuery] = useState('');
-  const [period, setPeriod] = useState('all');
+  const [dateRange, setDateRange] = useState<DateRangeValue>({ from: null, to: null });
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
@@ -50,9 +50,11 @@ export default function App() {
   const initialized = useRef(false);
   const bottom = useRef<HTMLDivElement>(null);
 
-  async function loadRecords(nextPeriod = period, nextQuery = query) {
-    const params = new URLSearchParams({ period: nextQuery.trim() ? 'all' : nextPeriod, query: nextQuery.trim() });
-    const result = await apiFetch<{ records: RecordItem[] }>('/api/records?' + params);
+  async function loadRecords(range: DateRangeValue = dateRange) {
+    const params = new URLSearchParams();
+    if (range.from && range.to) { params.set('period', 'custom'); params.set('date_from', range.from); params.set('date_to', range.to); }
+    else params.set('period', 'all');
+    const result = await apiFetch<{ records: RecordItem[] }>('/api/records?' + params.toString());
     setRecords(result.records);
   }
 
@@ -138,6 +140,26 @@ export default function App() {
     } catch (reason) { setError(errorText(reason)); }
   }
 
+  async function changeDateRange(next: DateRangeValue) {
+    setDateRange(next); setError('');
+    try { await loadRecords(next); } catch (reason) { setError(errorText(reason)); }
+  }
+
+  const [statusBusyId, setStatusBusyId] = useState<string | null>(null);
+  async function toggleRecordStatus(record: RecordItem) {
+    if (statusBusyId) return;
+    setStatusBusyId(record.id); setError('');
+    try {
+      const result = await apiFetch<{ record: RecordItem }>(`/api/records/${record.id}/status`, {
+        method: 'PATCH', json: { status: record.status === 'done' ? 'open' : 'done', expected_version: Number(record.version) },
+      });
+      setRecords((previous) => previous.map((item) => item.id === record.id ? result.record : item));
+    } catch (reason) {
+      setError(errorText(reason));
+      if (reason instanceof ApiError && reason.status === 409) { try { await loadRecords(); } catch { /* primary error shown */ } }
+    } finally { setStatusBusyId(null); }
+  }
+
   async function importDemo() {
     setBusy(true); setError(''); setNotice('');
     try {
@@ -217,21 +239,14 @@ export default function App() {
             <button className="dataset-button" disabled={busy || !ready} onClick={() => void importDemo()}><Icon name="upload" />Загрузить датасет</button>
           </div>
 
-          <form className="filters" onSubmit={(event) => { event.preventDefault(); setError(''); void loadRecords().catch((reason) => setError(errorText(reason))); }}>
-            <div className="filter-field"><label htmlFor="period">Период</label><div className="field-with-icon"><Icon name="calendar" />
-              <select id="period" value={period} onChange={(event) => setPeriod(event.target.value)}>
-                <option value="all">Все даты</option><option value="today">Сегодня</option><option value="tomorrow">Завтра</option>
-                <option value="this_week">Эта неделя</option><option value="next_week">Следующая неделя</option>
-              </select></div></div>
-            <div className="search-field"><label htmlFor="search">Поиск по всей истории</label><div className="field-with-icon"><Icon name="search" />
-              <input id="search" value={query} onChange={(event) => setQuery(event.target.value)} maxLength={300} placeholder="Например, договор" />
-              <button className="search-button" disabled={!ready || busy}>Найти</button></div></div>
-          </form>
+          <div className="filters filters--calendar-only">
+            <div className="filter-field"><label>Период</label><DateRangePicker value={dateRange} disabled={!ready || busy} onChange={(next) => void changeDateRange(next)} /></div>
+          </div>
 
           <div className="records" tabIndex={0} aria-label="Список сохранённых записей">
             {!records.length && <div className="empty-records"><Icon name="document" /><p>Записей пока нет.<br />Создайте их в чате или загрузите датасет.</p></div>}
-            {records.map((record) => <article className={`record record--${record.kind}`} key={record.id}>
-              <span className="record-check" aria-hidden="true" />
+            {records.map((record) => <article className={`record record--${record.kind}${record.status === 'done' ? ' record--done' : ''}`} key={record.id}>
+              <button type="button" className={`record-check${record.status === 'done' ? ' is-done' : ''}`} aria-label={record.status === 'done' ? `Вернуть в невыполненные: ${record.text}` : `Отметить выполненным: ${record.text}`} aria-pressed={record.status === 'done'} disabled={statusBusyId === record.id || record.status === 'cancelled'} onClick={() => void toggleRecordStatus(record)}>{record.status === 'done' ? '✓' : ''}</button>
               <div className="record-main"><span className="badge">{labels[record.kind]}</span><h3>{record.text}</h3>
                 <small>{record.timezone} · {record.id.slice(0, 8)}</small></div>
               <time>{record.scheduled_date ? new Date(`${record.scheduled_date}T00:00:00`).toLocaleDateString('ru-RU', { day: '2-digit', month: 'short', year: 'numeric' }) : 'Без даты'}{record.scheduled_time ? `, ${record.scheduled_time.slice(0, 5)}` : ''}</time>

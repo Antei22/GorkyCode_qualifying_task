@@ -46,7 +46,7 @@ class DefaultChangePlanner:
     def prepare(self, context: TurnContext, intent: OperationIntent,
                 target: RecordSnapshot | None,
                 previous_plan: ChangePlan | None = None) -> ChangePlan:
-        if intent.action not in (Action.CREATE, Action.UPDATE, Action.CANCEL):
+        if intent.action not in (Action.CREATE, Action.UPDATE, Action.CANCEL, Action.COMPLETE, Action.REOPEN):
             raise DomainError('Для этого действия нельзя подготовить изменение.')
         if intent.action == Action.CREATE and target is not None:
             raise DomainError('Создание не может изменять существующую запись.')
@@ -71,6 +71,12 @@ class DefaultChangePlanner:
             ).model_dump()
 
         patch = intent.changes
+        if intent.action in (Action.COMPLETE, Action.REOPEN):
+            values['status'] = 'done' if intent.action == Action.COMPLETE else 'open'
+            after = RecordSnapshot.model_validate(values)
+            plan = make_change_plan(intent.action.value, before, after)
+            context.trace['planner_result'] = plan.model_dump(mode='json')
+            return plan
         supplied = patch.model_fields_set
         unknown = set(intent.unknown_fields)
         if intent.action != Action.CANCEL:

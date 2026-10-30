@@ -77,6 +77,8 @@ class PostgresTargetResolver:
             self.connection, context.owner_id, query=target.query,
             kind=hard_kind, temporal=temporal_scope, day=day, moment=moment,
             now=context.now, limit=21,
+            statuses=(('open',) if intent.action.value == 'complete' else
+                      ('done',) if intent.action.value == 'reopen' else None),
         )
         stage = 'lexical'
         if target.person:
@@ -220,10 +222,20 @@ class PostgresOperationExecutor:
                 self.connection, context.owner_id, after.id,
                 int(plan.before.revision), draft,
             )
-        else:
+        elif plan.action == 'cancel':
             row = self.repository.cancel_record_versioned(
                 self.connection, context.owner_id, after.id,
                 int(plan.before.revision), context.now,
+            )
+        elif plan.action == 'complete':
+            row = self.repository.change_status_versioned(
+                self.connection, context.owner_id, after.id,
+                int(plan.before.revision), 'open', 'done',
+            )
+        else:
+            row = self.repository.change_status_versioned(
+                self.connection, context.owner_id, after.id,
+                int(plan.before.revision), 'done', 'open',
             )
         if not row:
             raise DomainError(

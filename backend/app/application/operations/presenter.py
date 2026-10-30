@@ -28,6 +28,15 @@ class DefaultOutcomePresenter:
         if outcome.phase != Phase.COMPLETED:
             return 'Уточните параметры операции.'
         if outcome.execution is not None:
+            if outcome.execution.action in (Action.COMPLETE.value, Action.REOPEN.value):
+                if len(outcome.execution.records) > 1:
+                    return (f'Отмечено выполненными: {len(outcome.execution.records)} записей.'
+                            if outcome.execution.action == Action.COMPLETE.value
+                            else f'Возвращено в активные: {len(outcome.execution.records)} записей.')
+                record = outcome.execution.records[0]
+                return (f'Запись выполнена: «{record.text}».'
+                        if outcome.execution.action == Action.COMPLETE.value
+                        else f'Запись возвращена в активные: «{record.text}».')
             record = outcome.execution.records[0]
             if outcome.execution.action == Action.CANCEL.value:
                 return f'{_CANCELLED[record.kind]}: «{record.text}».'

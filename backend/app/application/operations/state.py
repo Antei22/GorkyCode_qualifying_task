@@ -81,6 +81,7 @@ def merge_intent(previous: OperationIntent,
         ambiguous_fields=tuple(sorted(ambiguous_fields)),
         ambiguity_values=ambiguity_values,
         ambiguity_evidence=ambiguity_evidence,
+        all_matches=current.all_matches or previous.all_matches,
         # A request for another slot belongs only to the current turn.
         alternative_requested=current.alternative_requested,
     )

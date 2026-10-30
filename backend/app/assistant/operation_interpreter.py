@@ -153,6 +153,7 @@ class Proposal(BaseModel):
         ),
     )
     selected_candidate_number: int | None = Field(default=None, ge=1, le=20)
+    all_matches: bool = False
 
 
 class AuditFinding(BaseModel):
@@ -174,8 +175,11 @@ class AuditResult(BaseModel):
 
 INSTRUCTIONS = '''Ты преобразуешь русскую реплику в одну структурированную операцию.
 Ты ничего не выполняешь и не утверждаешь, что данные сохранены.
-action: create, update, cancel, read, list или unknown. LIST — список записей по
+action: create, update, cancel, complete, reopen, read, list или unknown. LIST — список записей по
 фильтрам без конкретного target_query; READ — поиск конкретной записи.
+COMPLETE означает отметить существующую запись выполненной (open -> done), REOPEN — вернуть
+выполненную запись в активные (done -> open). Эти действия не меняют дату, текст, тип или
+длительность. all_matches=true допустим только при явном «все», «всех», «каждую» или «каждый».
 turn=new для самостоятельной новой команды; continue только для ответа на текущий
 вопрос; confirm только для явного подтверждения предложенного плана; abandon для
 отказа от незавершённого черновика. Изменение даты, времени, текста, типа или
@@ -349,6 +353,10 @@ class LLMOperationInterpreter:
         except (ValueError, TypeError, ValidationError) as error:
             raise DomainError('Модель вернула некорректный разбор операции.') from error
         llm_proposal = proposal
+        if proposal.action in (Action.COMPLETE, Action.REOPEN):
+            proposal = proposal.model_copy(update={
+                'all_matches': proposal.all_matches and self._explicit_all_matches(context.message),
+            })
         proposal = self._guard_current_temporal(context.message, proposal)
         proposal = self._guard_patch_evidence(context.message, proposal)
         proposal = self._normalize_list_action(context.message, proposal)
@@ -431,7 +439,7 @@ class LLMOperationInterpreter:
             effective_action = (pending.intent.action if proposal.action == Action.UNKNOWN
                                 and pending is not None else proposal.action)
             if effective_action in (Action.READ, Action.LIST, Action.UPDATE,
-                                    Action.CANCEL):
+                                    Action.CANCEL, Action.COMPLETE, Action.REOPEN):
                 person = extract_person_constraint(context.message)
                 if person:
                     target_values['person'] = person
@@ -493,6 +501,7 @@ class LLMOperationInterpreter:
             changes=changes,
             read_fields=proposal.read_fields,
             unknown_fields=proposal.unknown_fields,
+            all_matches=proposal.all_matches,
             ambiguous_fields=ambiguous_fields,
             ambiguity_values=ambiguity_values,
             ambiguity_evidence=ambiguity_evidence,
@@ -548,6 +557,11 @@ class LLMOperationInterpreter:
             ],
         })
         return result
+
+    @staticmethod
+    def _explicit_all_matches(message: str) -> bool:
+        value = message.lower().replace('ё', 'е')
+        return bool(re.search(r'\b(?:все|всех|всю|каждую|каждый|каждое|все\s+подходящ\w*)\b', value))
 
     @classmethod
     def _needs_audit(cls, message, proposal, pending):
@@ -1558,6 +1572,9 @@ class LLMOperationInterpreter:
             'отменить': 'cancel', 'удалить': 'cancel',
             'посмотреть': 'read', 'найти': 'read', 'прочитать': 'read',
             'список': 'list', 'показать список': 'list',
+            'завершить': 'complete', 'заверши': 'complete',
+            'выполнить': 'complete', 'выполни': 'complete', 'готово': 'complete',
+            'вернуть': 'reopen', 'возобновить': 'reopen',
         }
         if isinstance(raw.get('action'), str):
             value = raw['action'].lower().replace('ё', 'е').strip()

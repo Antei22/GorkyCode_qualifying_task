@@ -46,7 +46,9 @@ class DefaultOperationPolicy:
     Updates and cancellations require confirmation by default. A deployment can
     also require it for creation without changing the coordinator.
     """
-    confirmation_actions: frozenset[Action] = frozenset({Action.UPDATE, Action.CANCEL})
+    confirmation_actions: frozenset[Action] = frozenset({
+        Action.UPDATE, Action.CANCEL, Action.COMPLETE, Action.REOPEN,
+    })
 
     def evaluate(self, context: TurnContext, intent: OperationIntent,
                  plan: ChangePlan | None,
@@ -94,6 +96,8 @@ class DefaultOperationPolicy:
             return self._reject('read_with_changes', 'Просмотр не должен изменять запись.')
         if intent.action == Action.READ:
             return PolicyDecision(phase=Phase.READY)
+        if intent.action in (Action.COMPLETE, Action.REOPEN) and intent.changes.model_fields_set:
+            return self._reject('status_with_changes', 'Команда выполнения может менять только статус записи.')
         if (intent.action == Action.UPDATE and not supplied_changes
                 and not intent.unknown_fields):
             return self._reject('changes_missing', 'Не указано, что изменить.')
@@ -109,11 +113,26 @@ class DefaultOperationPolicy:
             return self._reject('action_mismatch', 'Подготовлен план другого действия.')
         if plan.fingerprint != plan_fingerprint(plan.action, plan.before, plan.after):
             return self._reject('invalid_fingerprint', 'План изменения повреждён.')
-        if plan.before is not None and plan.before.status != 'open':
-            return self._reject('target_not_open', 'Эту запись уже нельзя изменить.')
+        if plan.before is not None:
+            if intent.action in (Action.UPDATE, Action.CANCEL) and plan.before.status != 'open':
+                return self._reject('target_not_open', 'Эту запись уже нельзя изменить.')
+            if intent.action == Action.COMPLETE and plan.before.status != 'open':
+                return self._reject('target_not_open', 'Эта запись уже выполнена.')
+            if intent.action == Action.REOPEN and plan.before.status != 'done':
+                return self._reject('target_not_done', 'Эта запись ещё не выполнена.')
 
         final = plan.after
         missing = []
+        if intent.action in (Action.COMPLETE, Action.REOPEN):
+            if intent.action in self.confirmation_actions:
+                confirmed = pending is not None and pending.confirmed_fingerprint == plan.fingerprint
+                if not confirmed:
+                    question = (f'Подтвердите: отметить «{plan.before.text}» выполненным?'
+                                if intent.action == Action.COMPLETE
+                                else f'Подтвердите: вернуть «{plan.before.text}» в невыполненные?')
+                    return PolicyDecision(phase=Phase.NEED_CONFIRMATION, question=question)
+            return PolicyDecision(phase=Phase.READY)
+
         if final.kind is None:
             missing.append('kind')
         if not final.text.strip():
