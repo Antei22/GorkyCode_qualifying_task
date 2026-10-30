@@ -44,6 +44,8 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8090/v1}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-GigaChat-3-Lightning}
+      LLM_EMBEDDING_MODEL: ${LLM_EMBEDDING_MODEL:-Embeddings}
+      SEMANTIC_SEARCH_ENABLED: ${SEMANTIC_SEARCH_ENABLED:-1}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-45}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}

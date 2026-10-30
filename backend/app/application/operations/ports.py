@@ -1,5 +1,5 @@
 """Dependency boundaries for the planned flow. No SQL/LLM implementations yet."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
@@ -17,6 +17,7 @@ class TurnContext:
     message: str
     now: datetime  # Inject from Clock, including timezone; never use dataset dates.
     history: tuple[tuple[str, str], ...] = ()
+    trace: dict = field(default_factory=dict, compare=False)
 
 
 class IntentInterpreter(Protocol):
@@ -26,6 +27,11 @@ class IntentInterpreter(Protocol):
 
 
 class TargetResolver(Protocol):
+    def list(self, context: TurnContext,
+             intent: OperationIntent) -> TargetResolution:
+        """List records by hard kind and temporal filters without semantic search."""
+        ...
+
     def resolve(self, context: TurnContext, intent: OperationIntent,
                 selected_id: UUID | None = None) -> TargetResolution:
         """Owner-scoped search, explicit time filters and chronological ranking.

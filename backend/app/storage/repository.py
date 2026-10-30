@@ -37,25 +37,30 @@ class Repository:
     def create(con, owner, draft, source='chat', source_id=None, raw=None):
         fields = draft.model_dump()
         return con.execute('''INSERT INTO records
-            (id,owner_id,kind,text,scheduled_date,scheduled_time,duration_minutes,duration_source,duration_description,timezone,source,source_id,raw_payload)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+            (id,owner_id,kind,text,scheduled_date,scheduled_end_date,scheduled_time,duration_minutes,duration_source,duration_description,user_duration,duration_status,blocking_duration_source,timezone,source,source_id,raw_payload)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
             (uuid4(), owner, fields['kind'], fields['text'], fields['scheduled_date'],
-             fields['scheduled_time'], fields['duration_minutes'], fields['duration_source'],
-             fields['duration_description'], fields['timezone'],
+             fields['scheduled_end_date'], fields['scheduled_time'], fields['duration_minutes'], fields['duration_source'],
+             fields['duration_description'], Jsonb(fields['user_duration']) if fields['user_duration'] else None,
+             fields['duration_status'], fields['blocking_duration_source'], fields['timezone'],
              source, source_id, Jsonb(raw or {}))).fetchone()
 
     @staticmethod
     def create_with_id(con, owner, record_id, draft, source='chat'):
         fields = draft.model_dump()
         return con.execute('''INSERT INTO records
-            (id,owner_id,kind,text,scheduled_date,scheduled_time,duration_minutes,
-             duration_source,duration_description,timezone,source,raw_payload)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+            (id,owner_id,kind,text,scheduled_date,scheduled_end_date,scheduled_time,duration_minutes,
+             duration_source,duration_description,user_duration,blocking_duration_source,
+             duration_status,timezone,source,raw_payload)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
             RETURNING *''',
             (record_id, owner, fields['kind'], fields['text'],
-             fields['scheduled_date'], fields['scheduled_time'],
+             fields['scheduled_date'], fields['scheduled_end_date'], fields['scheduled_time'],
              fields['duration_minutes'], fields['duration_source'],
-             fields['duration_description'], fields['timezone'], source)).fetchone()
+             fields['duration_description'],
+             Jsonb(fields['user_duration']) if fields['user_duration'] else None,
+             fields['blocking_duration_source'], fields['duration_status'],
+             fields['timezone'], source)).fetchone()
 
     @staticmethod
     def get_record(con, owner, record_id):
@@ -82,6 +87,10 @@ class Repository:
                  OR (%s='past' AND scheduled_date IS NOT NULL AND
                      scheduled_date + COALESCE(scheduled_time,time '23:59:59') < %s))
             ORDER BY
+                CASE WHEN %s::text IS NULL THEN 0
+                     WHEN lower(text)=lower(%s) THEN 0
+                     WHEN strpos(lower(text),lower(%s)) > 0 THEN 1
+                     ELSE 2 END,
                 CASE WHEN scheduled_date + COALESCE(scheduled_time,time '23:59:59') >= %s THEN 0
                      WHEN scheduled_date IS NULL THEN 1 ELSE 2 END,
                 CASE WHEN scheduled_date + COALESCE(scheduled_time,time '23:59:59') >= %s
@@ -91,21 +100,35 @@ class Repository:
                 scheduled_date DESC NULLS LAST, scheduled_time DESC NULLS LAST, id
             LIMIT %s''',
             (owner, kind, kind, query, query, query, day, day, moment, moment,
-             temporal, temporal, now, temporal, now, now, now, now, limit)).fetchall()
+             temporal, temporal, now, temporal, now,
+             query, query, query, now, now, now, limit)).fetchall()
 
     @staticmethod
     def update_record(con, owner, record_id, expected_version, draft):
         fields = draft.model_dump()
         return con.execute('''UPDATE records SET kind=%s, text=%s,
-            scheduled_date=%s, scheduled_time=%s, duration_minutes=%s,
-            duration_source=%s, duration_description=%s, timezone=%s,
+            scheduled_date=%s, scheduled_end_date=%s, scheduled_time=%s, duration_minutes=%s,
+            duration_source=%s, duration_description=%s, user_duration=%s,
+            duration_status=%s, blocking_duration_source=%s, timezone=%s,
             version=version+1, updated_at=now()
             WHERE owner_id=%s AND id=%s AND version=%s AND status='open'
             RETURNING *''',
             (fields['kind'], fields['text'], fields['scheduled_date'],
-             fields['scheduled_time'], fields['duration_minutes'],
+             fields['scheduled_end_date'], fields['scheduled_time'], fields['duration_minutes'],
              fields['duration_source'], fields['duration_description'],
-             fields['timezone'], owner, record_id, expected_version)).fetchone()
+             Jsonb(fields['user_duration']) if fields['user_duration'] else None,
+             fields['duration_status'], fields['blocking_duration_source'],
+             fields['timezone'], owner,
+             record_id, expected_version)).fetchone()
+
+    @staticmethod
+    def trace_search(con, context, intent, query, stage, rows):
+        con.execute('''INSERT INTO operation_search_traces
+            (owner_id,request_id,raw_text,parsed_intent,search_query,search_stage,candidate_ids)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)''',
+            (context.owner_id, context.request_id, context.message,
+             Jsonb(intent.model_dump(mode='json')), query, stage,
+             Jsonb([str(row['id']) for row in rows])))
 
     @staticmethod
     def cancel_record_versioned(con, owner, record_id, expected_version, now):
@@ -119,13 +142,21 @@ class Repository:
             (owner, record_id, expected_version, local_now)).fetchone()
 
     @staticmethod
-    def list_records(con, owner, first=None, last=None, kind=None, limit=100, now=None):
+    def list_records(con, owner, first=None, last=None, kind=None, limit=100,
+                     now=None, kinds=None):
         now = now or datetime.now()
         today, current_time = now.date(), now.time().replace(tzinfo=None)
-        return con.execute('''SELECT * FROM records WHERE owner_id=%s AND status <> 'cancelled'
+        return con.execute('''SELECT records.*,
+            duration_minutes AS blocking_duration_minutes,
+            CASE WHEN scheduled_date IS NOT NULL AND scheduled_time IS NOT NULL
+                      AND duration_minutes IS NOT NULL
+                 THEN scheduled_date + scheduled_time
+                      + duration_minutes * interval '1 minute' END AS reserved_until
+            FROM records WHERE owner_id=%s AND status <> 'cancelled'
             AND (%s::date IS NULL OR scheduled_date >= %s)
             AND (%s::date IS NULL OR scheduled_date <= %s)
             AND (%s::text IS NULL OR kind=%s)
+            AND (%s::text[] IS NULL OR kind=ANY(%s::text[]))
             ORDER BY
                 CASE
                     WHEN scheduled_date > %s OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)) THEN 0
@@ -138,6 +169,7 @@ class Repository:
                 CASE WHEN scheduled_date < %s OR (scheduled_date=%s AND scheduled_time < %s) THEN scheduled_time END DESC NULLS LAST,
                 id LIMIT %s''',
             (owner, first, first, last, last, kind, kind,
+             list(kinds) if kinds else None, list(kinds) if kinds else None,
              today, today, current_time, today, today, current_time,
              today, today, current_time, today, today, current_time,
              today, today, current_time, limit)).fetchall()
@@ -148,7 +180,13 @@ class Repository:
         query = query.strip()
         now = now or datetime.now()
         today, current_time = now.date(), now.time().replace(tzinfo=None)
-        return con.execute('''SELECT * FROM records WHERE owner_id=%s AND status <> 'cancelled'
+        return con.execute('''SELECT records.*,
+            duration_minutes AS blocking_duration_minutes,
+            CASE WHEN scheduled_date IS NOT NULL AND scheduled_time IS NOT NULL
+                      AND duration_minutes IS NOT NULL
+                 THEN scheduled_date + scheduled_time
+                      + duration_minutes * interval '1 minute' END AS reserved_until
+            FROM records WHERE owner_id=%s AND status <> 'cancelled'
             AND (%s::text IS NULL OR kind=%s)
             AND (NOT %s OR scheduled_date IS NULL OR scheduled_date > %s
                  OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)))

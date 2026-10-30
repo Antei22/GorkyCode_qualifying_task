@@ -12,6 +12,7 @@ from psycopg import Error as DatabaseError
 from pydantic import BaseModel, ConfigDict, Field
 from app.assistant.agent import Assistant
 from app.assistant.operation_interpreter import LLMOperationInterpreter
+from app.assistant.search import HybridSearch
 from app.config import Settings
 from app.domain.models import DomainError, Kind
 from app.domain.time import Clock, period_bounds
@@ -37,8 +38,10 @@ def create_app(settings=None, repository=None, assistant=None, operation_interpr
     interpreter = operation_interpreter
     if interpreter is None and assistant is None and settings.unified_operations:
         interpreter = LLMOperationInterpreter(settings)
+    hybrid_search = HybridSearch(settings)
     service = Service(repo, assistant or Assistant(settings), clock,
-                      operation_interpreter=interpreter)
+                      operation_interpreter=interpreter,
+                      hybrid_search=hybrid_search)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -113,8 +116,17 @@ def create_app(settings=None, repository=None, assistant=None, operation_interpr
             raise HTTPException(422, 'Поиск выполняется по всей истории; уберите фильтр периода.')
         first, last = period_bounds(period, clock.now(), date_from, date_to)
         with repo.connect() as con:
-            rows = (repo.search(con, uid, query, kind, now=clock.now()) if query.strip()
-                    else repo.list_records(con, uid, first, last, kind, now=clock.now()))
+            if query.strip():
+                rows = repo.search(con, uid, query, kind, now=clock.now())
+                if not rows:
+                    pool = repo.list_records(
+                        con, uid, None, None, kind, now=clock.now(),
+                    )
+                    rows = hybrid_search.semantic_candidates(query, pool, limit=5)
+                    if rows:
+                        rows = hybrid_search.rerank(query, rows)
+            else:
+                rows = repo.list_records(con, uid, first, last, kind, now=clock.now())
         return {'records': rows, 'limit': 20 if query.strip() else 100}
 
     @app.post('/api/import/demo')

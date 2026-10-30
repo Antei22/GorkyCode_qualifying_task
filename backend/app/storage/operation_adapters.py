@@ -1,31 +1,41 @@
 """PostgreSQL adapters for the unified operation application layer."""
+from datetime import date, time, timedelta
 from app.application.operations.ports import TurnContext
 from app.domain.models import DomainError, RecordDraft
 from app.domain.operations import (
-    DurationValue, ExecutionResult, OperationIntent, RecordSnapshot,
+    DurationInput, DurationValue, ExecutionResult, OperationIntent, RecordSnapshot,
     TargetResolution,
 )
-from app.domain.time import parse_day, parse_time
+from app.domain.time import parse_day, parse_time, resolve_temporal
 
 
 def row_snapshot(row) -> RecordSnapshot:
+    user_duration = row.get('user_duration')
+    blocking_source = row.get('blocking_duration_source') or 'legacy_unknown'
     return RecordSnapshot(
         id=row['id'], kind=row['kind'], text=row['text'],
-        scheduled_date=row['scheduled_date'], scheduled_time=row['scheduled_time'],
+        scheduled_date=row['scheduled_date'],
+        scheduled_end_date=row.get('scheduled_end_date'),
+        scheduled_time=row['scheduled_time'],
         timezone=row['timezone'],
+        user_duration=(DurationInput.model_validate(user_duration)
+                       if user_duration else None),
+        duration_status=row.get('duration_status') or 'defaulted',
         duration=DurationValue(
             minutes=row.get('duration_minutes'),
             source=row.get('duration_source') or 'unknown',
             description=row.get('duration_description'),
+            blocking_source=blocking_source,
         ),
         status=row['status'], revision=str(row.get('version') or 1),
     )
 
 
 class PostgresTargetResolver:
-    def __init__(self, repository, connection):
+    def __init__(self, repository, connection, hybrid_search=None):
         self.repository = repository
         self.connection = connection
+        self.hybrid_search = hybrid_search
 
     def resolve(self, context: TurnContext, intent: OperationIntent,
                 selected_id=None) -> TargetResolution:
@@ -35,16 +45,83 @@ class PostgresTargetResolver:
             )
             return TargetResolution(candidates=(row_snapshot(row),) if row else ())
         target = intent.target
-        day = parse_day(target.date_expression, context.now) if target.date_expression else None
-        moment = parse_time(target.time_expression) if target.time_expression else None
+        hard_kind = target.kind or (target.kinds[0] if len(target.kinds) == 1 else None)
+        temporal_scope = target.temporal if isinstance(target.temporal, str) else 'unspecified'
+        try:
+            day = date.fromisoformat(target.date_expression) if target.date_expression else None
+        except ValueError:
+            day = parse_day(target.date_expression, context.now)
+        if not isinstance(target.temporal, str):
+            bounds = resolve_temporal(target.temporal, context.now)
+            if bounds.start == bounds.end:
+                day = bounds.start
+        try:
+            moment = time.fromisoformat(target.time_expression) if target.time_expression else None
+        except ValueError:
+            moment = parse_time(target.time_expression)
         rows = self.repository.resolve_records(
             self.connection, context.owner_id, query=target.query,
-            kind=target.kind, temporal=target.temporal, day=day, moment=moment,
+            kind=hard_kind, temporal=temporal_scope, day=day, moment=moment,
             now=context.now, limit=21,
         )
+        stage = 'lexical'
+        if not rows and target.query and self.hybrid_search is not None:
+            pool = self.repository.resolve_records(
+                self.connection, context.owner_id, query=None,
+                kind=hard_kind, temporal=temporal_scope, day=day, moment=moment,
+                now=context.now, limit=101,
+            )
+            rows = self.hybrid_search.semantic_candidates(target.query, pool, limit=5)
+            if rows:
+                rows = self.hybrid_search.rerank(target.query, rows)
+                stage = 'semantic_rerank' if len(rows) == 1 else 'semantic'
+            else:
+                stage = 'semantic_empty'
+        self.repository.trace_search(
+            self.connection, context, intent, target.query, stage, rows,
+        )
+        context.trace.update({
+            'search_stage': stage,
+            'candidate_ids': [str(row['id']) for row in rows[:20]],
+            'target_query': target.query,
+        })
         return TargetResolution(
             candidates=tuple(row_snapshot(row) for row in rows[:20]),
             truncated=len(rows) > 20,
+        )
+
+    def list(self, context: TurnContext, intent: OperationIntent) -> TargetResolution:
+        target = intent.target
+        first = last = None
+        if not isinstance(target.temporal, str):
+            bounds = resolve_temporal(target.temporal, context.now)
+            first, last = bounds.start, bounds.end
+        elif target.date_expression:
+            try:
+                first = last = date.fromisoformat(target.date_expression)
+            except ValueError:
+                first = last = parse_day(target.date_expression, context.now)
+        rows = self.repository.list_records(
+            self.connection, context.owner_id, first, last,
+            kind=target.kind, kinds=target.kinds, now=context.now,
+        )
+        self.repository.trace_search(
+            self.connection, context, intent, None, 'list', rows,
+        )
+        context.trace.update({
+            'search_stage': 'list',
+            'candidate_ids': [str(row['id']) for row in rows[:100]],
+            'target_kinds': list(target.kinds),
+            'target_query': None,
+            'normalized_temporal': {
+                'start': first.isoformat() if first else None,
+                'end_exclusive': ((last + timedelta(days=1)).isoformat()
+                                  if last else None),
+            },
+        })
+        return TargetResolution(
+            candidates=tuple(row_snapshot(row) for row in rows[:100]),
+            truncated=len(rows) > 100,
         )
 
 
@@ -59,10 +136,15 @@ class PostgresOperationExecutor:
             draft = RecordDraft(
                 kind=after.kind, text=after.text,
                 scheduled_date=after.scheduled_date,
+                scheduled_end_date=after.scheduled_end_date,
                 scheduled_time=after.scheduled_time,
                 duration_minutes=after.duration.minutes,
                 duration_source=after.duration.source,
                 duration_description=after.duration.description,
+                user_duration=(after.user_duration.model_dump(mode='json', exclude_none=True)
+                               if after.user_duration else None),
+                duration_status=after.duration_status,
+                blocking_duration_source=after.duration.blocking_source,
                 timezone=after.timezone,
             )
         if plan.action == 'create':

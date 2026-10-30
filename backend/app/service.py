@@ -1,4 +1,6 @@
 """Chat transaction, history, draft state and request idempotency."""
+import json
+import logging
 import re
 from psycopg.types.json import Jsonb
 from fastapi.encoders import jsonable_encoder
@@ -16,10 +18,15 @@ from app.storage.operation_adapters import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 class Service:
-    def __init__(self, repo, assistant, clock, operation_interpreter=None):
+    def __init__(self, repo, assistant, clock, operation_interpreter=None,
+                 hybrid_search=None):
         self.repo, self.assistant, self.clock = repo, assistant, clock
         self.operation_interpreter = operation_interpreter
+        self.hybrid_search = hybrid_search
         self.operation_presenter = DefaultOutcomePresenter()
 
     @staticmethod
@@ -105,7 +112,15 @@ class Service:
                 now=self.clock.now(),
                 history=tuple((row['role'], row['content']) for row in history_rows),
             )
-            resolver = PostgresTargetResolver(self.repo, con)
+            context.trace.update({
+                'raw_text': message,
+                'phase': pending.phase if pending else 'new',
+                'pending_before': (pending.model_dump(mode='json', exclude_unset=True)
+                                   if pending else None),
+            })
+            resolver = PostgresTargetResolver(
+                self.repo, con, hybrid_search=self.hybrid_search,
+            )
             planner = DefaultChangePlanner()
             policy = CalendarOperationPolicy(self.repo, con)
             executor = PostgresOperationExecutor(self.repo, con)
@@ -115,6 +130,17 @@ class Service:
             )
             outcome = coordinator.handle(context, pending)
             state_payload = dump_pending(outcome.pending) if outcome.pending else None
+            context.trace.update({
+                'pending_after': state_payload,
+                'selected_id': (str(outcome.pending.selected_record_id)
+                                if outcome.pending and outcome.pending.selected_record_id
+                                else context.trace.get('selected_id')),
+                'confirmation_decision': context.trace.get('confirmation_decision'),
+            })
+            logger.info(
+                'operation_turn %s',
+                json.dumps(context.trace, ensure_ascii=False, default=str),
+            )
             con.execute(
                 'UPDATE sessions SET operation_state=%s WHERE id=%s',
                 (Jsonb(state_payload) if state_payload else None, owner),
@@ -142,13 +168,27 @@ class Service:
 
     @staticmethod
     def _snapshot_payload(item):
+        from datetime import datetime, timedelta
+        reserved_until = None
+        if (item.scheduled_date is not None and item.scheduled_time is not None
+                and item.duration.minutes is not None):
+            reserved_until = datetime.combine(
+                item.scheduled_date, item.scheduled_time,
+            ) + timedelta(minutes=item.duration.minutes)
         return {
             'id': item.id, 'kind': item.kind, 'text': item.text,
             'scheduled_date': item.scheduled_date,
+            'scheduled_end_date': item.scheduled_end_date,
             'scheduled_time': item.scheduled_time,
             'duration_minutes': item.duration.minutes,
             'duration_source': item.duration.source,
             'duration_description': item.duration.description,
+            'user_duration': (item.user_duration.model_dump(mode='json', exclude_none=True)
+                              if item.user_duration else None),
+            'duration_status': item.duration_status,
+            'blocking_duration_minutes': item.duration.minutes,
+            'blocking_duration_source': item.duration.blocking_source,
+            'reserved_until': reserved_until,
             'timezone': item.timezone, 'status': item.status,
             'version': item.revision,
         }

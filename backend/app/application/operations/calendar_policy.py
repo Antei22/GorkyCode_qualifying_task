@@ -60,7 +60,8 @@ class CalendarOperationPolicy:
         )
         question = (
             f'На {after.scheduled_date:%d.%m.%Y} в {after.scheduled_time:%H:%M} '
-            f'уже запланирована встреча «{conflict["text"]}». '
+            f'уже запланирована встреча «{conflict["text"]}»; для неё '
+            f'зарезервировано время до {self._reserved_until(conflict):%H:%M}. '
             f'Ближайшее свободное время — {nearest:%d.%m.%Y в %H:%M}. Подтвердить?'
         )
         return decision.model_copy(update={
@@ -69,6 +70,11 @@ class CalendarOperationPolicy:
             'alternative_plan': alternative_plan,
             'alternative_intent': alternative_intent,
         })
+
+    @staticmethod
+    def _reserved_until(row):
+        start = datetime.combine(row['scheduled_date'], row['scheduled_time'])
+        return start + timedelta(minutes=row.get('duration_minutes') or 60)
 
     def _alternative(self, context, intent, plan, decision):
         after = plan.after
