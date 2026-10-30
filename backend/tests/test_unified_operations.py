@@ -35,6 +35,67 @@ class ScriptedInterpreter:
                     duration=DurationInput(minutes=30),
                 ),
             ))
+        if message == 'создай встречу с диапазоном':
+            return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
+                action=Action.CREATE,
+                changes=RecordPatch(
+                    kind='meeting', text='Встреча с мамой',
+                    date_expression='завтра', time_expression='15:00',
+                    duration=DurationInput(
+                        type='range', min_minutes=60, max_minutes=120,
+                        evidence='час-два',
+                    ),
+                ),
+            ))
+        if message == 'создай встречу без длительности':
+            return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
+                action=Action.CREATE,
+                changes=RecordPatch(
+                    kind='meeting', text='Встреча без точной длительности',
+                    date_expression='завтра', time_expression='15:00',
+                ),
+            ))
+        if message == 'создай раннюю встречу без длительности':
+            return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
+                action=Action.CREATE,
+                changes=RecordPatch(
+                    kind='meeting', text='Длинная встреча',
+                    date_expression='завтра', time_expression='10:00',
+                ),
+            ))
+        if message == 'создай блокирующую встречу':
+            return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
+                action=Action.CREATE,
+                changes=RecordPatch(
+                    kind='meeting', text='Встреча в середине',
+                    date_expression='завтра', time_expression='11:30',
+                    duration=DurationInput(
+                        type='exact', minutes=30, evidence='30 минут',
+                    ),
+                ),
+            ))
+        if message == '2 часа':
+            return Interpretation(
+                turn=TurnKind.CONTINUE,
+                intent=OperationIntent(changes=RecordPatch(
+                    duration=DurationInput(
+                        type='exact', minutes=120, evidence='2 часа',
+                    ),
+                )),
+            )
+        if message == 'не знаю':
+            return Interpretation(
+                turn=TurnKind.CONTINUE,
+                intent=OperationIntent(unknown_fields=('duration',)),
+            )
+        if message == 'спроси длительность встречи с мамой':
+            return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
+                action=Action.READ,
+                target=TargetQuery(
+                    query='Встреча с мамой', kind='meeting', temporal='future',
+                ),
+                read_fields=('duration',),
+            ))
         if message == 'покажи другое время':
             return Interpretation(
                 turn=TurnKind.CONTINUE,
@@ -159,6 +220,69 @@ class UnifiedPostgresTests(unittest.TestCase):
         second = self.chat('создай первую встречу', request_id)
         self.assertEqual(first, second)
         self.assertEqual(len(self.rows()), 1)
+
+    def test_user_range_and_default_blocking_are_persisted_separately(self):
+        ranged = self.chat('создай встречу с диапазоном')['records'][0]
+        self.assertEqual(ranged['user_duration']['type'], 'range')
+        self.assertEqual(ranged['user_duration']['min_minutes'], 60)
+        self.assertEqual(ranged['user_duration']['max_minutes'], 120)
+        self.assertEqual(ranged['blocking_duration_minutes'], 120)
+        self.assertEqual(ranged['blocking_duration_source'], 'user_range_max')
+        self.assertEqual(ranged['duration_status'], 'provided')
+
+        answer = self.chat('спроси длительность встречи с мамой')
+        self.assertIn('1–2 часа', answer['answer'])
+        with self.repo.connect() as con:
+            trace = con.execute(
+                'SELECT raw_text,parsed_intent,search_query,candidate_ids '
+                'FROM operation_search_traces WHERE owner_id=%s '
+                'ORDER BY id DESC LIMIT 1', (self.owner,),
+            ).fetchone()
+        self.assertEqual(trace['search_query'], 'Встреча с мамой')
+        self.assertEqual(trace['parsed_intent']['read_fields'], ['duration'])
+        self.assertEqual(trace['candidate_ids'], [ranged['id']])
+
+        owner = self.repo.new_session()
+        try:
+            service = Service(
+                self.repo, assistant=object(), clock=self.clock,
+                operation_interpreter=ScriptedInterpreter(),
+            )
+            waiting = service.chat(
+                owner, uuid4(), 'создай встречу без длительности',
+            )
+            self.assertIsNotNone(waiting['pending'])
+            self.assertIn('Сколько будет длиться', waiting['answer'])
+            defaulted = service.chat(owner, uuid4(), 'не знаю')['records'][0]
+            self.assertIsNone(defaulted['user_duration'])
+            self.assertEqual(defaulted['blocking_duration_minutes'], 60)
+            self.assertEqual(defaulted['duration_status'], 'declined_to_specify')
+            self.assertEqual(
+                defaulted['blocking_duration_source'], 'event_type_default',
+            )
+        finally:
+            with self.repo.connect() as con:
+                for table in ('chat_requests', 'chat_messages', 'records'):
+                    con.execute(f'DELETE FROM {table} WHERE owner_id=%s', (owner,))
+                con.execute('DELETE FROM sessions WHERE id=%s', (owner,))
+
+    def test_duration_answer_rechecks_conflicts_with_new_reserved_until(self):
+        self.chat('создай блокирующую встречу')
+        waiting = self.chat('создай раннюю встречу без длительности')
+        self.assertIn('Сколько будет длиться', waiting['answer'])
+        self.assertEqual(len(self.rows()), 1)
+
+        conflict = self.chat('2 часа')
+        self.assertIn('зарезервировано время до 12:00', conflict['answer'])
+        self.assertIn('Ближайшее свободное время', conflict['answer'])
+        self.assertEqual(len(self.rows()), 1)
+
+        completed = self.chat('да')
+        created = next(
+            row for row in completed['records'] if row['text'] == 'Длинная встреча'
+        )
+        self.assertEqual(created['scheduled_time'], '12:00:00')
+        self.assertEqual(created['blocking_duration_minutes'], 120)
 
 
 if __name__ == '__main__':

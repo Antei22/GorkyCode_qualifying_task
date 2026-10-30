@@ -1,4 +1,6 @@
 """Provider-independent state machine for one user operation."""
+import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -14,7 +16,13 @@ from .ports import (
     ChangePlanner, IntentInterpreter, OperationExecutor, OperationPolicy,
     TargetResolver, TurnContext,
 )
-from .state import InvalidTransition, merge_intent, pending_is_expired
+from .state import (
+    InvalidTransition, apply_pending_changes, merge_intent, merge_patch,
+    pending_is_expired,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -37,6 +45,21 @@ class OperationCoordinator:
         interpretation = self.interpreter.interpret(context, pending)
         turn = interpretation.turn
 
+        resolved_conflict_intent = None
+        if (pending is not None and pending.pending_changes
+                and turn in (TurnKind.CONFIRM, TurnKind.REJECT)):
+            resolved_conflict_intent = (
+                apply_pending_changes(pending.intent, pending.pending_changes)
+                if turn == TurnKind.CONFIRM else pending.intent
+            )
+            pending = pending.model_copy(update={
+                'phase': Phase.NEED_FIELDS,
+                'pending_changes': (),
+                'updated_at': context.now,
+                'expires_at': context.now + self.pending_ttl,
+            })
+            turn = TurnKind.CONTINUE
+
         if turn in (TurnKind.ABANDON, TurnKind.REJECT):
             return OperationOutcome(
                 phase=Phase.REJECTED,
@@ -46,7 +69,9 @@ class OperationCoordinator:
                 ),),
             )
 
-        continuing = turn in (TurnKind.CONTINUE, TurnKind.CONFIRM)
+        continuing = turn in (
+            TurnKind.CONTINUE, TurnKind.CONFIRM, TurnKind.CORRECTION,
+        )
         if pending is not None and pending_is_expired(pending, context.now):
             if turn != TurnKind.NEW:
                 return OperationOutcome(
@@ -60,7 +85,9 @@ class OperationCoordinator:
         if continuing and pending is None:
             return self._need_intent('pending_missing', 'Нет операции, которую можно продолжить.')
 
-        if turn == TurnKind.CONFIRM:
+        if resolved_conflict_intent is not None:
+            intent = resolved_conflict_intent
+        elif turn == TurnKind.CONFIRM:
             if pending.phase != Phase.NEED_CONFIRMATION or pending.proposed_plan is None:
                 return self._need_intent(
                     'confirmation_not_expected',
@@ -69,11 +96,52 @@ class OperationCoordinator:
             intent = pending.intent
         elif continuing:
             try:
-                intent = merge_intent(pending.intent, interpretation.intent)
+                intent, accepted, same, conflicts = merge_patch(
+                    pending.intent, interpretation.intent,
+                    allow_overwrite=turn == TurnKind.CORRECTION,
+                )
             except InvalidTransition as error:
                 return OperationOutcome(
                     phase=Phase.REJECTED,
                     issues=(ValidationIssue(code=error.code, message=str(error)),),
+                )
+            logger.info('patch_merge %s', json.dumps({
+                'raw_text': context.message,
+                'current_draft': pending.intent.changes.model_dump(
+                    mode='json', exclude_unset=True,
+                ),
+                'expected_field': self._expected_field(pending),
+                'llm_patch': (interpretation.intent.changes.model_dump(
+                    mode='json', exclude_unset=True,
+                ) if interpretation.intent else {}),
+                'merge_result': {
+                    'accepted': {
+                        field: intent.changes.model_dump(
+                            mode='json', exclude_unset=True,
+                        ).get(field)
+                        for field in accepted
+                    },
+                    'conflicts': {
+                        item.field: {
+                            'old': item.old_value, 'new': item.new_value,
+                        } for item in conflicts
+                    },
+                },
+                'accepted_fields': accepted,
+                'same_fields': same,
+                'conflicting_fields': [item.field for item in conflicts],
+                'pending_changes': [item.model_dump(mode='json') for item in conflicts],
+            }, ensure_ascii=False))
+            if conflicts:
+                state = self._pending(
+                    context, intent, Phase.NEED_CONFIRMATION, pending,
+                    plan=pending.proposed_plan,
+                    pending_changes=conflicts,
+                )
+                return OperationOutcome(
+                    phase=Phase.NEED_CONFIRMATION,
+                    pending=state,
+                    question=self._pending_changes_question(conflicts),
                 )
         else:
             intent = interpretation.intent or OperationIntent()
@@ -156,6 +224,13 @@ class OperationCoordinator:
                 )
 
         if intent.action == Action.READ:
+            if (intent.read_fields and selected_id is None
+                    and len(resolution.candidates) > 1):
+                return self._need_target(
+                    context, intent, pending, resolution.candidates,
+                    'target_ambiguous',
+                    'Найдено несколько подходящих записей. Какую именно выбрать?',
+                )
             decision = self.policy.evaluate(context, intent, None, pending)
             if decision.phase == Phase.READY:
                 return OperationOutcome(phase=Phase.COMPLETED,
@@ -250,7 +325,7 @@ class OperationCoordinator:
                                 question=decision.question, issues=decision.issues)
 
     def _pending(self, context, intent, phase, previous, candidate_ids=(),
-                 selected_id=None, plan=None):
+                 selected_id=None, plan=None, pending_changes=()):
         created_at = previous.created_at if previous else context.now
         return PendingOperation(
             operation_id=previous.operation_id if previous else self.operation_id_factory(),
@@ -259,10 +334,81 @@ class OperationCoordinator:
             candidate_ids=tuple(candidate_ids),
             selected_record_id=selected_id,
             proposed_plan=plan,
+            pending_changes=tuple(pending_changes),
             created_at=created_at,
             updated_at=context.now,
             expires_at=context.now + self.pending_ttl,
         )
+
+    @staticmethod
+    def _expected_field(pending):
+        if pending is None or pending.phase != Phase.NEED_FIELDS:
+            return None
+        if pending.intent.ambiguous_fields:
+            return None
+        if pending.proposed_plan is not None:
+            record = pending.proposed_plan.after
+            kind, text = record.kind, record.text
+            day, clock = record.scheduled_date, record.scheduled_time
+            duration_missing = (
+                record.duration_status == 'missing'
+                or record.duration.minutes is None
+            )
+        else:
+            changes = pending.intent.changes
+            kind, text = changes.kind, changes.text or ''
+            day, clock = changes.date_expression, changes.time_expression
+            duration_missing = (
+                changes.duration is None
+                and 'duration' not in pending.intent.unknown_fields
+            )
+        if kind is None:
+            return 'kind'
+        if not text.strip():
+            return 'text'
+        if kind in ('meeting', 'reminder') and day is None:
+            return 'date_expression'
+        if kind in ('meeting', 'reminder') and clock is None:
+            return 'time_expression'
+        if kind == 'meeting' and duration_missing:
+            return 'duration'
+        return None
+
+    @staticmethod
+    def _pending_changes_question(changes):
+        labels = {
+            'kind': 'тип', 'text': 'текст', 'date_expression': 'дату',
+            'time_expression': 'время', 'timezone': 'часовой пояс',
+            'duration': 'длительность',
+        }
+        if len(changes) == 1:
+            change = changes[0]
+            return (
+                f'Вы ранее указали {labels[change.field]} '
+                f'{OperationCoordinator._display_value(change.old_value)}, '
+                f'а сейчас — {OperationCoordinator._display_value(change.new_value)}. '
+                f'Изменить {labels[change.field]} на '
+                f'{OperationCoordinator._display_value(change.new_value)}?'
+            )
+        old = ', '.join(
+            f'{labels[item.field]} {OperationCoordinator._display_value(item.old_value)}'
+            for item in changes
+        )
+        new = ', '.join(
+            f'{labels[item.field]} {OperationCoordinator._display_value(item.new_value)}'
+            for item in changes
+        )
+        return f'Изменить {old} на {new}?'
+
+    @staticmethod
+    def _display_value(value):
+        if isinstance(value, dict):
+            if value.get('type') in {'exact', 'approximate'}:
+                return f'{value.get("minutes")} мин.'
+            if value.get('type') == 'range':
+                return f'{value.get("min_minutes")}–{value.get("max_minutes")} мин.'
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
 
     def _need_target(self, context, intent, previous, candidates, code, message):
         decision = PolicyDecision(

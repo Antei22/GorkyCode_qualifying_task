@@ -5,7 +5,10 @@ Never derives 'today' from the maximum date in an imported dataset.
 import re
 from calendar import monthrange
 from datetime import date, datetime, time, timedelta
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
+from pydantic import Field
+from pydantic import BaseModel, ConfigDict
 from .models import DomainError, FieldInputError
 
 WEEKDAYS = {'понедельник': 0, 'вторник': 1, 'среду': 2, 'среда': 2,
@@ -34,6 +37,150 @@ class Clock:
 
     def context(self):
         return f'Сейчас {self.now().isoformat()}, пояс {self.zone.key}. Неделя: понедельник–воскресенье.'
+
+
+class ParsedTemporal(BaseModel):
+    model_config = ConfigDict(extra='forbid', frozen=True)
+    evidence: str | None = None
+
+
+class AbsoluteDate(ParsedTemporal):
+    type: Literal['absolute']
+    year: int = Field(ge=1, le=9999)
+    month: int = Field(ge=1, le=12)
+    day: int = Field(ge=1, le=31)
+
+
+class RelativeDate(ParsedTemporal):
+    type: Literal['relative']
+    days_offset: int = Field(ge=-3660, le=3660)
+
+
+class MonthDayDate(ParsedTemporal):
+    type: Literal['month_day']
+    month: int = Field(ge=1, le=12)
+    day: int = Field(ge=1, le=31)
+    year: None = None
+    resolution: Literal['nearest_future'] = 'nearest_future'
+
+
+class WeekdayDate(ParsedTemporal):
+    type: Literal['weekday']
+    weekday: int = Field(ge=0, le=6)
+    week_offset: int = Field(ge=0, le=52)
+
+
+class PeriodDate(ParsedTemporal):
+    type: Literal['end_of_period', 'start_of_period']
+    period: Literal['week', 'month']
+    period_offset: int = Field(ge=0, le=52)
+
+
+ParsedDate = Annotated[
+    AbsoluteDate | RelativeDate | MonthDayDate | WeekdayDate | PeriodDate,
+    Field(discriminator='type'),
+]
+
+
+class ParsedTime(BaseModel):
+    model_config = ConfigDict(extra='forbid', frozen=True)
+    type: Literal['absolute'] = 'absolute'
+    hour: int = Field(ge=0, le=23)
+    minute: int = Field(ge=0, le=59)
+    evidence: str | None = None
+
+
+def normalize_date_payload(value):
+    """Normalize one common date patch for every record kind.
+
+    Only the fields belonging to the declared discriminator survive. A missing
+    relative offset may be recovered from its exact evidence token.
+    """
+    if not isinstance(value, dict):
+        return value
+    kind = value.get('type')
+    evidence = value.get('evidence')
+    normalized_evidence = (evidence or '').lower().replace('ё', 'е').strip(' .,!?')
+    offsets = {'сегодня': 0, 'завтра': 1, 'послезавтра': 2, 'вчера': -1,
+               'на сегодня': 0, 'на завтра': 1, 'на послезавтра': 2}
+    allowed = {
+        'absolute': ('type', 'year', 'month', 'day', 'evidence'),
+        'relative': ('type', 'days_offset', 'evidence'),
+        'month_day': ('type', 'month', 'day', 'year', 'resolution', 'evidence'),
+        'weekday': ('type', 'weekday', 'week_offset', 'evidence'),
+        'start_of_period': ('type', 'period', 'period_offset', 'evidence'),
+        'end_of_period': ('type', 'period', 'period_offset', 'evidence'),
+    }.get(kind)
+    if allowed is None:
+        return value
+    result = {field: value[field] for field in allowed if field in value}
+    if (kind == 'relative' and result.get('days_offset') is None
+            and normalized_evidence in offsets):
+        result['days_offset'] = offsets[normalized_evidence]
+    if kind == 'month_day':
+        result.setdefault('year', None)
+        result.setdefault('resolution', 'nearest_future')
+    if kind == 'weekday':
+        result.setdefault('week_offset', 0)
+    if kind in {'start_of_period', 'end_of_period'}:
+        result.setdefault('period_offset', 0)
+    return result
+
+
+def normalize_time_payload(value):
+    """Normalize the shared time patch without interpreting record kind."""
+    if not isinstance(value, dict):
+        return value
+    result = {field: value[field] for field in (
+        'type', 'hour', 'minute', 'evidence'
+    ) if field in value}
+    result.setdefault('type', 'absolute')
+    result.setdefault('minute', 0)
+    return result
+
+
+def resolve_date(value: ParsedDate, now: datetime) -> date:
+    """Resolve LLM semantic date data; never parses user-facing date text."""
+    if isinstance(value, AbsoluteDate):
+        try:
+            return date(value.year, value.month, value.day)
+        except ValueError as error:
+            raise FieldInputError('date_expression', 'Такой календарной даты нет.') from error
+    if isinstance(value, RelativeDate):
+        return now.date() + timedelta(days=value.days_offset)
+    if isinstance(value, MonthDayDate):
+        for year in range(now.year, now.year + 9):
+            try:
+                candidate = date(year, value.month, value.day)
+            except ValueError:
+                continue
+            if candidate >= now.date():
+                return candidate
+        raise FieldInputError('date_expression', 'Такой календарной даты нет.')
+    if isinstance(value, WeekdayDate):
+        monday = now.date() - timedelta(days=now.weekday())
+        target = monday + timedelta(days=value.week_offset * 7 + value.weekday)
+        if value.week_offset == 0 and target < now.date():
+            target += timedelta(days=7)
+        return target
+    if isinstance(value, PeriodDate):
+        first = now.date().replace(day=1)
+        if value.period == 'week':
+            start = now.date() - timedelta(days=now.weekday())
+            start += timedelta(weeks=value.period_offset)
+            return (start + timedelta(days=6) if value.type == 'end_of_period'
+                    else start)
+        month_index = first.month - 1 + value.period_offset
+        year, month = first.year + month_index // 12, month_index % 12 + 1
+        start = date(year, month, 1)
+        if value.type == 'start_of_period':
+            return start
+        return date(year, month, monthrange(year, month)[1])
+    raise FieldInputError('date_expression', 'Не удалось разобрать дату.')
+
+
+def resolve_time(value: ParsedTime) -> time:
+    return time(value.hour, value.minute)
 
 
 def parse_day(expression, now):

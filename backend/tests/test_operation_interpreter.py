@@ -1,6 +1,7 @@
 import json
+import re
 import unittest
-from datetime import timedelta
+from datetime import date, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -32,11 +33,78 @@ class FakeClient:
         name = kwargs['tools'][0]['function']['name']
         arguments = (self.audit_arguments if name == 'audit_operation'
                      else self.arguments)
+        arguments = _structured_temporal_fixture(arguments)
         call = SimpleNamespace(function=SimpleNamespace(
             name=name, arguments=json.dumps(arguments),
         ))
         message = SimpleNamespace(tool_calls=[call])
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def _structured_temporal_fixture(source):
+    """Translate pre-v2 fixture payloads; production accepts only typed values."""
+    data = json.loads(json.dumps(source))
+
+    def parsed_date(value):
+        if not isinstance(value, str):
+            return value
+        value = value.strip().lower()
+        offsets = {'сегодня': 0, 'завтра': 1, 'послезавтра': 2, 'вчера': -1,
+                   'tomorrow': 1}
+        if value in offsets:
+            return {'type': 'relative', 'days_offset': offsets[value]}
+        weekdays = {'понедельник': 0, 'вторник': 1, 'среду': 2,
+                    'среда': 2, 'четверг': 3, 'пятницу': 4,
+                    'пятница': 4, 'субботу': 5, 'суббота': 5,
+                    'воскресенье': 6}
+        weekday = value.removeprefix('в ').removeprefix('во ')
+        if weekday in weekdays:
+            return {'type': 'weekday', 'weekday': weekdays[weekday],
+                    'week_offset': 0}
+        try:
+            parsed = date.fromisoformat(value)
+            return {'type': 'absolute', 'year': parsed.year,
+                    'month': parsed.month, 'day': parsed.day}
+        except ValueError:
+            return None
+
+    def parsed_time(value):
+        if not isinstance(value, str):
+            return value
+        match = re.fullmatch(r'(\d{1,2})(?::(\d{2}))?', value.strip())
+        if not match:
+            return None
+        return {'hour': int(match.group(1)), 'minute': int(match.group(2) or 0)}
+
+    def translate(container, mapping):
+        for old, new in mapping.items():
+            if old not in container:
+                continue
+            value = container.pop(old)
+            converted = parsed_date(value) if 'date' in old else parsed_time(value)
+            if converted is not None:
+                container.setdefault(new, converted)
+
+    translate(data, {'date_expression': 'date',
+                     'target_date_expression': 'target_date',
+                     'time_expression': 'time',
+                     'target_time_expression': 'target_time'})
+    if isinstance(data.get('target'), dict):
+        translate(data['target'], {'date_expression': 'date',
+                                   'time_expression': 'time'})
+    if isinstance(data.get('changes'), dict):
+        translate(data['changes'], {'date_expression': 'date',
+                                    'time_expression': 'time'})
+    for finding in data.get('findings', []):
+        if finding.get('field') == 'date_expression' and 'date' not in finding:
+            parsed = parsed_date(finding.get('value'))
+            if parsed is not None:
+                finding['date'] = parsed
+        if finding.get('field') == 'time_expression' and 'time' not in finding:
+            parsed = parsed_time(finding.get('value'))
+            if parsed is not None:
+                finding['time'] = parsed
+    return data
 
 
 def context(message):
@@ -68,8 +136,8 @@ class InterpreterTests(unittest.TestCase):
             None,
         )
         self.assertEqual(result.intent.action, Action.UPDATE)
-        self.assertEqual(result.intent.target.date_expression, 'завтра')
-        self.assertEqual(result.intent.changes.date_expression, 'в пятницу')
+        self.assertEqual(result.intent.target.date_expression, '2026-10-29')
+        self.assertEqual(result.intent.changes.date_expression, '2026-10-30')
         self.assertEqual(result.intent.changes.duration.minutes, 120)
         self.assertEqual(len(client.requests), 1)
 
@@ -133,7 +201,7 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(result.intent.target.kind, 'task')
         self.assertEqual(result.intent.changes.text, 'новая задача')
 
-    def test_ambiguous_call_keeps_type_open_and_reminder_clears_event_time(self):
+    def test_ambiguous_call_keeps_type_open_and_reminder_keeps_collected_time(self):
         adapter, _ = self.interpreter({
             'turn': 'new', 'action': 'create', 'kind': 'meeting',
             'kind_ambiguous': True,
@@ -158,7 +226,9 @@ class InterpreterTests(unittest.TestCase):
         second = second_adapter.interpret(context('Напоминание'), pending)
         self.assertEqual(second.intent.changes.kind, 'reminder')
         self.assertIsNone(second.intent.changes.date_expression)
-        self.assertIn('date_expression', second.intent.changes.model_fields_set)
+        self.assertNotIn('date_expression', second.intent.changes.model_fields_set)
+        self.assertEqual(first.intent.changes.date_expression, '2026-10-29')
+        self.assertEqual(first.intent.changes.time_expression, '16:00')
         self.assertEqual(second.intent.target.model_fields_set, set())
 
     def test_unsupported_model_kind_becomes_missing_field(self):
@@ -180,16 +250,29 @@ class InterpreterTests(unittest.TestCase):
         result = adapter.interpret(context('Создай встречу'), None)
         self.assertEqual(result.intent.changes.kind, 'meeting')
 
-    def test_verbose_model_date_is_recovered_from_user_message(self):
+    def test_numeric_absolute_date_is_normalized_to_canonical_iso(self):
         adapter, _ = self.interpreter({
             'turn': 'new', 'action': 'create', 'kind': 'meeting',
             'text': 'встретиться с Алексеем',
-            'date_expression': 'tomorrow at some point',
+            'date': {'type': 'absolute', 'year': 2026, 'month': 11, 'day': 20,
+                     'evidence': '20.11.2026'},
+            'time': {'hour': 10, 'minute': 0, 'evidence': 'в 10:00'},
         })
         result = adapter.interpret(
-            context('Хочу встретиться с Алексеем завтра'), None,
+            context('Назначь встречу с мамой в 10:00 на 20.11.2026'), None,
         )
-        self.assertEqual(result.intent.changes.date_expression, 'завтра')
+        self.assertEqual(result.intent.changes.date_expression, '2026-11-20')
+        self.assertEqual(result.intent.changes.time_expression, '10:00')
+        self.assertEqual(
+            result.intent.field_evidence['date_expression'], '20.11.2026',
+        )
+        self.assertEqual(
+            result.intent.field_evidence['time_expression'], 'в 10:00',
+        )
+        self.assertEqual(
+            result.intent.source_text,
+            'Назначь встречу с мамой в 10:00 на 20.11.2026',
+        )
 
     def test_invalid_model_date_is_dropped_when_user_gave_no_date(self):
         adapter, _ = self.interpreter({
@@ -409,7 +492,44 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(result.turn, TurnKind.CONTINUE)
         self.assertEqual(result.intent.action, Action.UNKNOWN)
         self.assertEqual(result.intent.changes.time_expression, '16:00')
-        self.assertIsNone(result.intent.changes.duration)
+        self.assertEqual(result.intent.changes.duration.minutes, 240)
+
+    def test_date_follow_up_keeps_date_and_time_from_one_answer(self):
+        now = context('На завтра в 10 утра').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_FIELDS,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                changes={'kind': 'reminder', 'text': 'увидеться с Саней'},
+            ),
+            proposed_plan=make_change_plan(
+                'create', None,
+                RecordSnapshot(
+                    id=uuid4(), kind='reminder', text='увидеться с Саней',
+                    scheduled_date=None, scheduled_time=None,
+                    timezone='Europe/Moscow', status='open', revision='new',
+                ),
+            ),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, _ = self.interpreter({
+            'turn': 'continue', 'action': 'unknown',
+            'patch': {
+                'date': {
+                    'type': 'relative', 'year': None,
+                    'resolution': 'nearest_future', 'evidence': 'завтра',
+                },
+                'time': {
+                    'type': 'absolute', 'hour': 10, 'minute': 0,
+                    'evidence': 'в 10 утра',
+                },
+            },
+        })
+        result = adapter.interpret(context('На завтра в 10 утра'), pending)
+        self.assertEqual(result.turn, TurnKind.CONTINUE)
+        self.assertEqual(result.intent.changes.date_expression, '2026-10-29')
+        self.assertEqual(result.intent.changes.time_expression, '10:00')
 
     def test_tool_schema_explains_contextual_colloquial_time(self):
         adapter, client = self.interpreter({
@@ -417,7 +537,9 @@ class InterpreterTests(unittest.TestCase):
         })
         adapter.interpret(context('Создай задачу test'), None)
         schema = client.requests[0]['tools'][0]['function']['parameters']
-        description = schema['properties']['time_expression']['description']
+        self.assertIn('date', schema['properties'])
+        self.assertNotIn('date_expression', schema['properties'])
+        description = schema['properties']['time']['description']
         self.assertIn('на 4 дня', description)
         system = client.requests[0]['messages'][0]['content']
         self.assertIn('expected_field=time_expression', system)
@@ -461,6 +583,81 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(result.intent.target.model_fields_set, set())
         self.assertEqual(len(client.requests), 1)
 
+    def test_duration_answer_cannot_overwrite_collected_text(self):
+        now = context('час-два').now
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_FIELDS,
+            intent=OperationIntent(
+                action=Action.CREATE,
+                changes={
+                    'kind': 'meeting', 'text': 'встреча с мамой',
+                    'date_expression': '2026-10-30',
+                    'time_expression': '10:00',
+                },
+            ),
+            proposed_plan=make_change_plan(
+                'create', None,
+                RecordSnapshot(
+                    id=uuid4(), kind='meeting', text='встреча с мамой',
+                    scheduled_date=now.date() + timedelta(days=2),
+                    scheduled_time=now.time().replace(
+                        hour=10, minute=0, second=0, microsecond=0, tzinfo=None,
+                    ),
+                    timezone='Europe/Moscow', status='open', revision='new',
+                ),
+            ),
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, _ = self.interpreter({
+            'turn': 'continue', 'action': 'unknown',
+            'text': 'час-два', 'duration_description': 'час-два',
+            'target_query': 'ошибочная цель',
+        })
+        result = adapter.interpret(context('час-два'), pending)
+        self.assertEqual(result.turn, TurnKind.CONTINUE)
+        self.assertEqual(result.intent.changes.model_fields_set, {'duration'})
+        self.assertEqual(result.intent.changes.duration.type, 'range')
+        self.assertEqual(result.intent.changes.duration.min_minutes, 60)
+        self.assertEqual(result.intent.changes.duration.max_minutes, 120)
+        self.assertEqual(result.intent.changes.duration.evidence, 'час-два')
+        self.assertNotIn('text', result.intent.changes.model_fields_set)
+        self.assertEqual(result.intent.target.model_fields_set, set())
+
+    def test_duration_question_cannot_search_with_question_words(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'read',
+            'target_query': 'Сколько будет длится встреча с мамой',
+            'target_kind': 'meeting', 'target_temporal': 'future',
+            'requested_fields': [],
+        })
+        result = adapter.interpret(
+            context('Сколько будет длится встреча с мамой'), None,
+        )
+        self.assertEqual(result.intent.target.query, 'встреча с мамой')
+        self.assertEqual(result.intent.target.kind, 'meeting')
+        self.assertEqual(result.intent.target.temporal, 'future')
+        self.assertEqual(result.intent.read_fields, ('duration',))
+
+    def test_invalid_optional_duration_and_provider_extras_do_not_break_create(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'meeting',
+            'text': 'встреча с мамой',
+            'date': {'type': 'absolute', 'year': 2026, 'month': 10, 'day': 30,
+                     'evidence': '30.10.26'},
+            'time': {'type': 'absolute', 'hour': 10, 'minute': 0,
+                     'evidence': '10'},
+            'user_duration': {'type': 'exact', 'minutes': None},
+            'provider_comment': 'not part of the contract',
+            'requested_fields': None,
+        })
+        result = adapter.interpret(
+            context('Создай встречу с мамой в 10 30.10.26'), None,
+        )
+        self.assertEqual(result.intent.action, Action.CREATE)
+        self.assertEqual(result.intent.changes.text, 'встреча с мамой')
+        self.assertNotIn('duration', result.intent.changes.model_fields_set)
+
     def test_create_continuation_cannot_pollute_target_query(self):
         now = context('завтра').now
         pending = PendingOperation(
@@ -485,7 +682,7 @@ class InterpreterTests(unittest.TestCase):
             'target_date_expression': 'завтра',
         })
         result = adapter.interpret(context('завтра'), pending)
-        self.assertEqual(result.intent.changes.date_expression, 'завтра')
+        self.assertEqual(result.intent.changes.date_expression, '2026-10-29')
         self.assertEqual(result.intent.target.model_fields_set, set())
 
     def test_concrete_value_supersedes_repeated_unknown_marker(self):

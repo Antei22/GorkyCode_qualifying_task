@@ -1,28 +1,49 @@
 """Structured LLM adapter. It proposes intent and never executes a mutation."""
 import json
+import logging
 import re
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from openai import OpenAI
 
-from app.domain.duration import explicit_duration
+from app.domain.duration import duration_request, explicit_duration, parse_user_duration
 from app.domain.models import DomainError
-from app.domain.time import parse_day
+from app.domain.time import (
+    ParsedDate, ParsedTime, normalize_date_payload, normalize_time_payload,
+    resolve_date, resolve_time,
+)
 from app.domain.operations import (
-    Action, Interpretation, OperationField, OperationIntent, PendingOperation,
-    Phase, RecordPatch, TargetQuery, TurnKind,
+    Action, DurationInput, Interpretation, OperationField, OperationIntent,
+    PendingOperation, Phase, RecordPatch, TargetQuery, TurnKind,
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+class ProposalPatch(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    kind: str | None = None
+    text: str | None = None
+    date: ParsedDate | None = None
+    time: ParsedTime | None = None
+    timezone: str | None = None
+    user_duration: DurationInput | None = None
+
+
 class Proposal(BaseModel):
-    model_config = ConfigDict(extra='ignore')
+    model_config = ConfigDict(extra='forbid', populate_by_name=True)
     turn: TurnKind = TurnKind.UNKNOWN
     action: Action = Action.UNKNOWN
+    patch: ProposalPatch | None = Field(
+        default=None,
+        description='Только явно извлечённые из текущей реплики значения.',
+    )
     target_query: str | None = None
     target_kind: str | None = None
     target_temporal: str = 'unspecified'
-    target_date_expression: str | None = None
-    target_time_expression: str | None = None
+    target_date: ParsedDate | None = None
+    target_time: ParsedTime | None = None
     kind: str | None = None
     kind_ambiguous: bool = Field(
         default=False,
@@ -32,8 +53,11 @@ class Proposal(BaseModel):
         ),
     )
     text: str | None = None
-    date_expression: str | None = None
-    time_expression: str | None = Field(
+    date: ParsedDate | None = Field(default=None, description=(
+        'Семантическая дата: absolute, relative, month_day, weekday, '
+        'start_of_period или end_of_period. Добавь evidence из реплики.'
+    ))
+    time: ParsedTime | None = Field(
         default=None,
         description=(
             'Время начала из новой реплики. Учитывай ожидаемое поле и русские '
@@ -44,9 +68,16 @@ class Proposal(BaseModel):
     timezone: str | None = None
     duration_minutes: int | None = Field(default=None, ge=5, le=480)
     duration_description: str | None = None
+    user_duration: DurationInput | None = Field(
+        default=None,
+        description=(
+            'Длительность ровно в той точности, которую сообщил пользователь: '
+            'exact, approximate, range или qualitative. evidence обязательно.'
+        ),
+    )
     clear_fields: tuple[Literal['kind', 'text', 'date', 'time', 'timezone',
                                 'duration'], ...] = ()
-    read_fields: tuple[str, ...] = ()
+    read_fields: tuple[str, ...] = Field(default=(), alias='requested_fields')
     unknown_fields: tuple[Literal[
         'kind', 'text', 'date_expression', 'time_expression', 'timezone', 'duration',
     ], ...] = ()
@@ -73,6 +104,8 @@ class AuditFinding(BaseModel):
     field: OperationField
     disposition: Literal['explicit', 'ambiguous']
     value: str | None = None
+    date: ParsedDate | None = None
+    time: ParsedTime | None = None
     evidence: str = Field(min_length=1)
     ambiguous_with: OperationField | None = None
 
@@ -89,26 +122,55 @@ turn=new для самостоятельной новой команды; contin
 вопрос; confirm только для явного подтверждения предложенного плана; abandon для
 отказа от незавершённого черновика. Изменение даты, времени, текста, типа или
 длительности существующей записи всегда update, никогда cancel/create.
+Для явной коррекции вроде "нет, не в 10, давай в 11" верни turn=correction.
 Поля с префиксом target_ описывают СТАРУЮ запись; поля без префикса — только
 желаемое новое состояние. text — содержание создаваемой записи или новый текст.
-Для "с завтра на пятницу": завтра относится к target.date_expression, пятница к
-changes.date_expression. Не придумывай отсутствующие дату, время, тип и минуты.
+Даты возвращай структурами date/target_date, время — time/target_time.
+Абсолютная дата: {type:absolute, year, month, day}; без года: {type:month_day,
+month, day, year:null, resolution:nearest_future}; сдвиг: {type:relative,
+days_offset}. День недели передавай как weekday (0=пн…6=вс) и week_offset;
+границы периода — start_of_period/end_of_period с period. Всегда добавляй evidence,
+точную цитату из реплики. Для "с завтра на пятницу" завтра — target_date, пятница —
+date. Не придумывай отсутствующие дату, время, тип и минуты.
+Время возвращай как {type:absolute, hour, minute, evidence}. Если пользователь
+назвал только час, minute=0. Не ищи минуты среди соседних чисел. Числа внутри
+даты нельзя повторно использовать как час, минуты, длительность или другое поле.
+Один фрагмент исходной реплики нельзя использовать для двух полей, если значение
+не было явно названо дважды. Evidence даты и времени должны быть раздельными.
+Примеры:
+"Создай встречу с мамой в 10 30.10.26" → date={type:absolute,year:2026,
+month:10,day:30,evidence:"30.10.26"}, time={type:absolute,hour:10,minute:0,
+evidence:"10"}. Значение time=10:30 здесь ошибочно: 30 является частью даты.
+"Создай встречу в 15 25.12.26" → time=15:00, date=25.12.2026.
+"Создай встречу в 15:30 25.12.26" → time=15:30, date=25.12.2026.
 Встреча и напоминание — разные типы. Если пользователь лишь выражает намерение
 созвониться, увидеться, встретиться или выполнить синонимичное действие, но явно
 не называет тип записи, оставь kind пустым и верни kind_ambiguous=true. Сервер
 должен уточнить: создать само событие/встречу или напоминание о действии.
 Для вопроса "сколько будет длиться" используй
-read, read_fields=["duration"], target_temporal=future; "сколько длилась" — past.
+read, requested_fields=["duration"], target_temporal=future; "сколько длилась" — past.
+target_query содержит только идентифицирующую часть записи, без вопросительных и
+служебных слов. Например, "Сколько будет длиться встреча с мамой" →
+target_query="встреча с мамой", requested_fields=["duration"]. "Когда встреча с мамой" →
+тот же target_query, requested_fields=["date","time"]. Не копируй всю реплику в query.
+Длительность возвращай в user_duration, сохраняя точность пользователя:
+"на 2 часа" → exact/120; "примерно 2 часа" → approximate/120;
+"час-два" → range/60/120; "долго" → qualitative/long. Всегда приложи evidence.
+Не своди диапазон или приблизительное значение к точным минутам.
 Если пользователь явно просит убрать поле, добавь его имя в clear_fields; обычное
 отсутствие поля не означает очистку.
-Если пользователь прямо сообщает, что НЕ ЗНАЕТ значение поля (например, "хз",
-"не знаю", "без понятия"), добавь ожидаемое поле в unknown_fields. Это применимо
+Если пользователь прямо сообщает, что НЕ ЗНАЕТ или не хочет уточнять значение поля
+(например, "хз", "не знаю", "без понятия", "неважно", "оставь как есть"),
+добавь ожидаемое поле в unknown_fields. Это применимо
 к любому полю, не только к длительности. Не оставляй такой ответ просто пустым.
 Текущая операция содержит expected_field — это смысл вопроса, на который отвечает
 новая реплика. Если expected_field=time_expression, разговорные ответы «на 4 дня»,
 «в 4 дня», «на 4 часа дня» означают время начала 16:00. Не относись к ним как к
 duration. Если expected_field=duration, та же числовая конструкция может означать
 длительность. Контекст ожидаемого поля важнее изолированного прочтения фразы.
+Expected field означает обязательное сейчас поле, но не запрещает извлекать другие
+явно указанные значения. В follow-up верни все такие значения в patch текущей
+реплики. Не решай, можно ли заменять старое значение: это делает backend merge.
 Если система предложила свободное время и ждёт подтверждения, а пользователь просит
 другое время (например, «мне неудобно, какое ещё есть?», «покажи следующий вариант»),
 верни turn=continue, action=unknown и request_alternative=true. Это продолжение
@@ -124,11 +186,13 @@ AUDIT_INSTRUCTIONS = '''Проверь структурированный раз
 Ищи только явно присутствующие, но пропущенные значения полей, а также выражения,
 роль которых неоднозначна. Не заполняй поле только потому, что оно обязательно.
 Для каждого finding приведи точную непрерывную цитату evidence из новой реплики.
+Для date_expression заполняй поле date структурой ParsedDate, для time_expression —
+поле time структурой ParsedTime; не возвращай даты и время строками.
 disposition=explicit допустим только при единственной смысловой роли; value содержит
 извлечённое значение. disposition=ambiguous используй, если одна цитата может означать
 разные поля; укажи второе поле в ambiguous_with и не придумывай value.
 Учитывай expected_field текущего диалога: ответ на явный вопрос о времени относится
-к time_expression, ответ на вопрос о длительности — к duration. Уже заполненные поля
+к time, ответ на вопрос о длительности — к duration. Уже заполненные поля
 не повторяй, кроме случая, когда их роль на самом деле неоднозначна.
 Если первичный разбор выбрал meeting/reminder, хотя пользователь лишь выразил
 намерение и не назвал тип записи, отметь kind как ambiguous.
@@ -154,6 +218,7 @@ class LLMOperationInterpreter:
             {'role': 'system', 'content': INSTRUCTIONS},
             {'role': 'user', 'content': (
                 f'Сейчас: {context.now.isoformat()}\n'
+                f'Timezone: {getattr(context.now.tzinfo, "key", str(context.now.tzinfo))}\n'
                 f'Текущая операция: {json.dumps(pending_context, ensure_ascii=False)}\n'
                 f'Недавний диалог:\n{history}\n'
                 f'Новая реплика: {context.message}'
@@ -209,7 +274,8 @@ class LLMOperationInterpreter:
                 else context.message
             )
             proposal = self._verify_duration(duration_source or context.message, proposal)
-            proposal = self._verify_dates(context, proposal)
+            proposal = self._normalize_read_target(context.message, proposal)
+            proposal = self._verify_temporal_evidence(context, proposal)
             if proposal.ambiguity_resolution is None:
                 proposal = self._recover_create_text(context.message, proposal, pending)
         selected = None
@@ -226,21 +292,26 @@ class LLMOperationInterpreter:
             temporal = self._temporal(proposal.target_temporal)
             if temporal != 'unspecified':
                 target_values['temporal'] = temporal
-            if proposal.target_date_expression is not None:
-                target_values['date_expression'] = proposal.target_date_expression
-            if proposal.target_time_expression is not None:
-                target_values['time_expression'] = proposal.target_time_expression
+            if proposal.target_date is not None:
+                target_values['date_expression'] = resolve_date(
+                    proposal.target_date, context.now,
+                ).isoformat()
+            if proposal.target_time is not None:
+                target_values['time_expression'] = resolve_time(
+                    proposal.target_time,
+                ).isoformat(timespec='minutes')
             target = TargetQuery(**target_values)
             change_values = {key: value for key, value in {
                     'kind': self._kind(proposal.kind),
                     'text': proposal.text,
-                    'date_expression': proposal.date_expression,
-                    'time_expression': proposal.time_expression,
+                    'date_expression': (resolve_date(
+                        proposal.date, context.now,
+                    ).isoformat() if proposal.date is not None else None),
+                    'time_expression': (resolve_time(
+                        proposal.time,
+                    ).isoformat(timespec='minutes') if proposal.time is not None else None),
                     'timezone': proposal.timezone,
-                    'duration': ({'minutes': proposal.duration_minutes,
-                                  'description': proposal.duration_description}
-                                 if proposal.duration_minutes is not None
-                                 or proposal.duration_description is not None else None),
+                    'duration': self._duration_input(proposal),
                 }.items() if value is not None}
             clear_names = {'kind': 'kind', 'text': 'text', 'date': 'date_expression',
                            'time': 'time_expression', 'timezone': 'timezone',
@@ -256,6 +327,13 @@ class LLMOperationInterpreter:
             ) from error
         intent_values = dict(
             action=proposal.action,
+            source_text=context.message,
+            field_evidence={key: value.evidence for key, value in {
+                'date_expression': proposal.date,
+                'time_expression': proposal.time,
+                'target.date_expression': proposal.target_date,
+                'target.time_expression': proposal.target_time,
+            }.items() if value is not None and value.evidence},
             target=target,
             changes=changes,
             read_fields=proposal.read_fields,
@@ -299,8 +377,8 @@ class LLMOperationInterpreter:
                 and proposal.kind in {'meeting', 'reminder'}
                 and not cls._has_explicit_kind_label(message)):
             return True
-        if (proposal.date_expression is None
-                and proposal.target_date_expression is None
+        if (proposal.date is None
+                and proposal.target_date is None
                 and cls._date_phrases(message)):
             return True
         clock_like = re.search(
@@ -308,7 +386,7 @@ class LLMOperationInterpreter:
             r'\b(?:в|на)\s+\d{1,2}(?:\s+час\w*)?(?:\s+(?:дня|вечера|утра|ночи))?\b',
             value,
         )
-        if clock_like and (proposal.time_expression is None
+        if clock_like and (proposal.time is None
                            or expected == 'time_expression'):
             return True
         duration_like = re.search(
@@ -394,7 +472,9 @@ class LLMOperationInterpreter:
                     else:
                         updates[field] = None
                 continue
-            if finding.value is None:
+            if (finding.value is None and not (
+                    finding.field == 'date_expression' and finding.date is not None
+                    or finding.field == 'time_expression' and finding.time is not None)):
                 continue
             field = finding.field
             if field == 'duration':
@@ -407,7 +487,8 @@ class LLMOperationInterpreter:
                 elif cls._evidence_present(message, finding.value):
                     updates['duration_description'] = finding.value
                 continue
-            if getattr(proposal, field) is not None:
+            proposal_field = cls._proposal_field(field)
+            if getattr(proposal, proposal_field) is not None:
                 continue
             if field == 'kind':
                 normalized = cls._kind(finding.value)
@@ -416,6 +497,10 @@ class LLMOperationInterpreter:
             elif field == 'text':
                 if cls._evidence_present(message, finding.value):
                     updates['text'] = finding.value
+            elif field == 'date_expression' and finding.date is not None:
+                updates['date'] = finding.date
+            elif field == 'time_expression' and finding.time is not None:
+                updates['time'] = finding.time
             else:
                 updates[field] = finding.value
         # Some temporal phrases have two valid record roles.  The audit model is
@@ -443,9 +528,17 @@ class LLMOperationInterpreter:
                     updates['duration_minutes'] = None
                     updates['duration_description'] = None
                 else:
-                    updates[field] = None
+                    updates[cls._proposal_field(field)] = None
         return (proposal.model_copy(update=updates) if updates else proposal,
                 tuple(sorted(ambiguous)), ambiguity_values, ambiguity_evidence)
+
+    @staticmethod
+    def _proposal_field(field):
+        return {
+            'date_expression': 'date', 'time_expression': 'time',
+            'target_date_expression': 'target_date',
+            'target_time_expression': 'target_time',
+        }.get(field, field)
 
     @staticmethod
     def _has_time_duration_collision(message, expected):
@@ -506,31 +599,74 @@ class LLMOperationInterpreter:
 
     @staticmethod
     def _verify_duration(message, proposal):
-        if proposal.duration_minutes is None:
+        if (proposal.user_duration is None
+                and proposal.duration_minutes is None
+                and proposal.duration_description is None):
             return proposal
-        actual = explicit_duration(message)
-        if actual == proposal.duration_minutes:
+        parsed = parse_user_duration(message)
+        if parsed is not None:
+            return proposal.model_copy(update={
+                'user_duration': DurationInput.model_validate(parsed),
+                'duration_minutes': None, 'duration_description': None,
+            })
+        updates = {}
+        if proposal.user_duration is not None:
+            evidence = proposal.user_duration.evidence
+            if not evidence or not LLMOperationInterpreter._evidence_present(
+                    message, evidence):
+                updates['user_duration'] = None
+        if proposal.duration_minutes is not None:
+            actual = explicit_duration(message)
+            if actual != proposal.duration_minutes:
+                updates['duration_minutes'] = None
+        return proposal.model_copy(update=updates) if updates else proposal
+
+    @staticmethod
+    def _duration_input(proposal):
+        if proposal.user_duration is not None:
+            return proposal.user_duration.model_dump(exclude_none=True)
+        if (proposal.duration_minutes is not None
+                or proposal.duration_description is not None):
+            return {
+                'minutes': proposal.duration_minutes,
+                'description': proposal.duration_description,
+            }
+        return None
+
+    @staticmethod
+    def _normalize_read_target(message, proposal):
+        """Enforce the server-verifiable duration-query split.
+
+        The LLM remains responsible for the general semantic target.  For the
+        sensitive duration read already recognized by the deterministic domain
+        rule, the question words can never leak into database search.
+        """
+        parsed = duration_request(message)
+        if (not parsed or parsed['action'] != 'read'
+                or proposal.action not in {Action.READ, Action.UNKNOWN}):
             return proposal
-        return proposal.model_copy(update={'duration_minutes': None})
+        return proposal.model_copy(update={
+            'action': Action.READ,
+            'target_query': parsed['query'],
+            'target_kind': proposal.target_kind or 'meeting',
+            'target_temporal': parsed['temporal'],
+            'read_fields': tuple(dict.fromkeys((*proposal.read_fields, 'duration'))),
+        })
 
     @classmethod
-    def _verify_dates(cls, context, proposal):
-        """Keep a model date only if the server can parse it.
-
-        If a compact model returns a verbose or translated value, recover the
-        single explicit date phrase from the user's own message. Multiple date
-        phrases are deliberately not guessed (for example, move from/to).
-        """
-        candidates = cls._date_phrases(context.message)
+    def _verify_temporal_evidence(cls, context, proposal):
+        """Retain structured temporal values only when their evidence is in-source."""
         updates = {}
-        for field in ('date_expression', 'target_date_expression'):
-            expression = getattr(proposal, field)
-            if expression is None:
-                continue
-            try:
-                parse_day(expression, context.now)
-            except DomainError:
-                updates[field] = candidates[0] if len(candidates) == 1 else None
+        for field in ('date', 'target_date', 'time', 'target_time'):
+            value = getattr(proposal, field)
+            if value is not None and value.evidence and not cls._evidence_present(
+                    context.message, value.evidence):
+                updates[field] = None
+            elif value is not None and field in {'date', 'target_date'}:
+                try:
+                    resolve_date(value, context.now)
+                except (DomainError, ValueError, OverflowError):
+                    updates[field] = None
         return proposal.model_copy(update=updates) if updates else proposal
 
     @staticmethod
@@ -543,6 +679,7 @@ class LLMOperationInterpreter:
         patterns = (
             r'\b(?:послезавтра|сегодня|завтра|вчера)\b',
             r'\b\d{4}-\d{2}-\d{2}\b',
+            r'\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b',
             rf'\b\d{{1,2}}\s+(?:{months})(?:\s+\d{{4}})?\b',
             rf'\b(?:в|во)?\s*(?:следующ(?:ий|ую|ее)\s+)?(?:{weekdays})\b',
             r'\b(?:до конца|в конце|конец)\s+(?:недели|месяца)\b',
@@ -565,6 +702,11 @@ class LLMOperationInterpreter:
         creating = proposal.action == Action.CREATE or (
             pending is not None and pending.intent.action == Action.CREATE
         )
+        # A short clarification belongs to the field selected by the backend.
+        # It must never be reused as record text by this generic recovery path.
+        if (pending is not None and proposal.turn != TurnKind.NEW
+                and cls._expected_field(pending) != 'text'):
+            return proposal
         if not creating or proposal.text is not None or proposal.unknown_fields:
             return proposal
         candidate = message.strip()
@@ -580,11 +722,11 @@ class LLMOperationInterpreter:
             candidate = re.sub(
                 re.escape(phrase), ' ', candidate, flags=re.IGNORECASE,
             )
-        if proposal.time_expression:
-            candidate = re.sub(
-                re.escape(proposal.time_expression), ' ', candidate,
-                flags=re.IGNORECASE,
-            )
+        for temporal in (proposal.date, proposal.target_date,
+                         proposal.time, proposal.target_time):
+            if temporal and temporal.evidence:
+                candidate = re.sub(re.escape(temporal.evidence), ' ', candidate,
+                                   flags=re.IGNORECASE)
         candidate = re.sub(r'\s+', ' ', candidate).strip(' .,;:!?—-')
         generic = {
             '', 'запись', 'задача', 'задачу', 'встреча', 'встречу',
@@ -605,28 +747,29 @@ class LLMOperationInterpreter:
                 updates.update({'text': proposal.target_query, 'target_query': None})
             if proposal.kind is None and proposal.target_kind:
                 updates.update({'kind': proposal.target_kind, 'target_kind': None})
-            if proposal.date_expression is None and proposal.target_date_expression:
-                updates['date_expression'] = proposal.target_date_expression
-            if proposal.time_expression is None and proposal.target_time_expression:
-                updates['time_expression'] = proposal.target_time_expression
+            if proposal.date is None and proposal.target_date:
+                updates['date'] = proposal.target_date
+            if proposal.time is None and proposal.target_time:
+                updates['time'] = proposal.target_time
             updates.update({
                 'target_query': None, 'target_kind': None,
                 'target_temporal': 'unspecified',
-                'target_date_expression': None, 'target_time_expression': None,
+                'target_date': None, 'target_time': None,
             })
         elif effective_action in (Action.READ, Action.CANCEL):
             if proposal.target_query is None and proposal.text:
                 updates.update({'target_query': proposal.text, 'text': None})
             if proposal.target_kind is None and proposal.kind:
                 updates.update({'target_kind': proposal.kind, 'kind': None})
-            if proposal.target_date_expression is None and proposal.date_expression:
-                updates['target_date_expression'] = proposal.date_expression
-            if proposal.target_time_expression is None and proposal.time_expression:
-                updates['target_time_expression'] = proposal.time_expression
+            if proposal.target_date is None and proposal.date:
+                updates['target_date'] = proposal.date
+            if proposal.target_time is None and proposal.time:
+                updates['target_time'] = proposal.time
             updates.update({
-                'kind': None, 'text': None, 'date_expression': None,
-                'time_expression': None, 'timezone': None,
+                'kind': None, 'text': None, 'date': None,
+                'time': None, 'timezone': None,
                 'duration_minutes': None, 'duration_description': None,
+                'user_duration': None,
                 'clear_fields': (),
             })
         return proposal.model_copy(update=updates) if updates else proposal
@@ -654,13 +797,19 @@ class LLMOperationInterpreter:
             record = pending.proposed_plan.after
             kind, text = record.kind, record.text
             day, clock = record.scheduled_date, record.scheduled_time
-            duration = record.duration.minutes
+            duration_missing = (
+                record.duration_status == 'missing'
+                or record.duration.minutes is None
+            )
         else:
             changes = pending.intent.changes
             kind, text = changes.kind, changes.text or ''
             day = changes.date_expression
             clock = changes.time_expression
-            duration = changes.duration.minutes if changes.duration else None
+            duration_missing = (
+                changes.duration is None
+                and 'duration' not in pending.intent.unknown_fields
+            )
         if kind is None:
             return 'kind'
         if not text.strip():
@@ -669,7 +818,7 @@ class LLMOperationInterpreter:
             return 'date_expression'
         if kind in ('meeting', 'reminder') and clock is None:
             return 'time_expression'
-        if kind == 'meeting' and duration is None:
+        if kind == 'meeting' and duration_missing:
             return 'duration'
         return None
 
@@ -683,12 +832,12 @@ class LLMOperationInterpreter:
                 'kind': selected_kind, 'ambiguity_resolution': 'kind',
                 'target_query': None, 'target_kind': None,
                 'target_temporal': 'unspecified',
-                'target_date_expression': None, 'target_time_expression': None,
-                'text': None, 'date_expression': None,
-                'time_expression': None, 'timezone': None,
+                'target_date': None, 'target_time': None,
+                'text': None, 'date': None,
+                'time': None, 'timezone': None,
                 'duration_minutes': None, 'duration_description': None,
-                'clear_fields': (('date', 'time')
-                                 if selected_kind == 'reminder' else ()),
+                'user_duration': None,
+                'clear_fields': (),
                 'read_fields': (), 'unknown_fields': (),
                 'selected_candidate_number': None,
             })
@@ -700,10 +849,11 @@ class LLMOperationInterpreter:
                 'turn': TurnKind.CONTINUE, 'action': Action.UNKNOWN,
                 'target_query': None, 'target_kind': None,
                 'target_temporal': 'unspecified',
-                'target_date_expression': None, 'target_time_expression': None,
-                'kind': None, 'text': None, 'date_expression': None,
-                'time_expression': None, 'timezone': None,
+                'target_date': None, 'target_time': None,
+                'kind': None, 'text': None, 'date': None,
+                'time': None, 'timezone': None,
                 'duration_minutes': None, 'duration_description': None,
+                'user_duration': None,
                 'clear_fields': (), 'read_fields': (), 'unknown_fields': (),
                 'selected_candidate_number': None,
             }
@@ -722,56 +872,78 @@ class LLMOperationInterpreter:
                 'turn': TurnKind.CONTINUE, 'action': Action.UNKNOWN,
                 'target_query': None, 'target_kind': None,
                 'target_temporal': 'unspecified',
-                'target_date_expression': None, 'target_time_expression': None,
-                'kind': None, 'text': None, 'date_expression': None,
-                'time_expression': None, 'timezone': None,
+                'target_date': None, 'target_time': None,
+                'kind': None, 'text': None, 'date': None,
+                'time': None, 'timezone': None,
                 'duration_minutes': None, 'duration_description': None,
+                'user_duration': None,
                 'clear_fields': (), 'read_fields': (), 'unknown_fields': (),
                 'selected_candidate_number': None,
             })
         expected = cls._expected_field(pending)
         if expected is None or cls._looks_like_new_command(message):
             return proposal
-        updates = {'turn': TurnKind.CONTINUE, 'action': Action.UNKNOWN}
-        # A number followed by "часа" is a duration in isolation, but it is an
-        # appointment time when answering the explicit question "На какое время?".
-        if expected == 'time_expression':
-            updates['duration_minutes'] = None
-            updates['duration_description'] = None
-        elif expected == 'duration':
-            updates['time_expression'] = None
-        # The expected field is authoritative conversation state. Reject a
-        # model attempt to mark some unrelated field as unknown.
-        if proposal.unknown_fields:
-            concrete = cls._proposal_has_value(proposal, expected)
-            marks_expected_unknown = expected in proposal.unknown_fields
-            # A concrete value from the new turn always supersedes an old
-            # unknown marker that the model copied from pending context.
-            updates['unknown_fields'] = (
-                (expected,) if marks_expected_unknown and not concrete else ()
-            )
-            if marks_expected_unknown and not concrete:
-                # An explicit "unknown" answer carries no new field value. It
-                # must never overwrite already collected data with the literal
-                # reply (for example, text="не знаю").
-                updates.update({
-                    'target_query': None, 'target_kind': None,
-                    'target_temporal': 'unspecified',
-                    'target_date_expression': None,
-                    'target_time_expression': None,
-                    'kind': None, 'text': None, 'date_expression': None,
-                    'time_expression': None, 'timezone': None,
-                    'duration_minutes': None, 'duration_description': None,
-                    'clear_fields': (), 'read_fields': (),
-                })
+        # expected_field is required now, but every explicit value in the
+        # current patch survives for the backend merge engine.
+        updates = {
+            'turn': (TurnKind.CORRECTION if proposal.turn == TurnKind.CORRECTION
+                     else TurnKind.CONTINUE),
+            'action': Action.UNKNOWN,
+            'target_query': None, 'target_kind': None,
+            'target_temporal': 'unspecified',
+            'target_date': None, 'target_time': None,
+            'read_fields': (), 'request_alternative': False,
+            'ambiguity_resolution': None, 'selected_candidate_number': None,
+        }
+        expected_fields = {
+            'kind': ('kind',),
+            'text': ('text',),
+            'date_expression': ('date',),
+            'time_expression': ('time',),
+            'timezone': ('timezone',),
+            'duration': ('duration_minutes', 'duration_description', 'user_duration'),
+        }[expected]
+        # Content/type/timezone are not generic temporal patch values. Keep
+        # them only when the backend explicitly requested that field.
+        if expected != 'kind':
+            updates.update({'kind': None, 'kind_ambiguous': False})
+        if expected != 'text':
+            updates['text'] = None
+        if expected != 'timezone':
+            updates['timezone'] = None
+        concrete = cls._proposal_has_value(proposal, expected)
+        marks_expected_unknown = expected in proposal.unknown_fields
+        if expected == 'duration' and cls._declines_duration(message):
+            marks_expected_unknown = True
+        if marks_expected_unknown and not concrete:
+            for field in expected_fields:
+                updates[field] = None
+        updates['unknown_fields'] = (
+            (expected,) if marks_expected_unknown and not concrete else ()
+        )
+        clear_name = {
+            'date_expression': 'date', 'time_expression': 'time',
+        }.get(expected, expected)
+        updates['clear_fields'] = tuple(
+            field for field in proposal.clear_fields if field == clear_name
+        )
         return proposal.model_copy(update=updates)
+
+    @staticmethod
+    def _declines_duration(message):
+        value = ' '.join(message.lower().replace('ё', 'е').split()).strip(' .,!')
+        return bool(re.search(
+            r'\b(?:не знаю|без понятия|неважно|не важно|оставь как есть|'
+            r'не хочу уточнять|любой вариант|по умолчанию|хз)\b', value,
+        ))
 
     @staticmethod
     def _proposal_has_value(proposal, field):
         if field == 'duration':
             return (proposal.duration_minutes is not None
-                    or proposal.duration_description is not None)
-        return getattr(proposal, field) is not None
+                    or proposal.duration_description is not None
+                    or proposal.user_duration is not None)
+        return getattr(proposal, LLMOperationInterpreter._proposal_field(field)) is not None
 
     @staticmethod
     def _looks_like_new_command(message):
@@ -796,8 +968,8 @@ class LLMOperationInterpreter:
             mapping = {
                 'query': 'target_query', 'text': 'target_query',
                 'kind': 'target_kind', 'temporal': 'target_temporal',
-                'date_expression': 'target_date_expression',
-                'time_expression': 'target_time_expression',
+                'date_expression': 'target_date', 'time_expression': 'target_time',
+                'date': 'target_date', 'time': 'target_time',
             }
             for key, output in mapping.items():
                 if key in target:
@@ -806,10 +978,66 @@ class LLMOperationInterpreter:
         if isinstance(changes, dict):
             duration = changes.pop('duration', None)
             if isinstance(duration, dict):
+                if duration.get('type'):
+                    raw.setdefault('user_duration', duration)
+                else:
+                    raw.setdefault('duration_minutes', duration.get('minutes'))
+                    raw.setdefault('duration_description', duration.get('description'))
+            for key, value in changes.items():
+                key = {'date_expression': 'date',
+                       'time_expression': 'time'}.get(key, key)
+                raw.setdefault(key, value)
+        patch = raw.pop('patch', None)
+        if isinstance(patch, dict):
+            duration = patch.pop('user_duration', patch.pop('duration', None))
+            if isinstance(duration, dict):
+                if duration.get('type'):
+                    raw.setdefault('user_duration', duration)
+                else:
+                    raw.setdefault('duration_minutes', duration.get('minutes'))
+                    raw.setdefault('duration_description', duration.get('description'))
+            for key, value in patch.items():
+                key = {'date_expression': 'date',
+                       'time_expression': 'time'}.get(key, key)
+                raw.setdefault(key, value)
+        # Providers sometimes flatten the documented duration object instead
+        # of placing it under changes. Normalize it before strict validation.
+        duration = raw.pop('duration', None)
+        if isinstance(duration, dict):
+            if duration.get('type'):
+                raw.setdefault('user_duration', duration)
+            else:
                 raw.setdefault('duration_minutes', duration.get('minutes'))
                 raw.setdefault('duration_description', duration.get('description'))
-            for key, value in changes.items():
-                raw.setdefault(key, value)
+        if raw.get('duration_type'):
+            raw.setdefault('user_duration', {
+                'type': raw.pop('duration_type'),
+                'minutes': raw.pop('duration_minutes', None),
+                'min_minutes': raw.pop('duration_min_minutes', None),
+                'max_minutes': raw.pop('duration_max_minutes', None),
+                'value': raw.pop('duration_value', None),
+                'evidence': raw.pop('duration_evidence', None),
+            })
+        if 'requested_fields' in raw and 'read_fields' not in raw:
+            raw['read_fields'] = raw.pop('requested_fields')
+        for field in ('clear_fields', 'read_fields', 'unknown_fields'):
+            if raw.get(field) is None:
+                raw[field] = ()
+        if raw.get('target_temporal') is None:
+            raw['target_temporal'] = 'unspecified'
+        for field in ('kind_ambiguous', 'request_alternative'):
+            if raw.get(field) is None:
+                raw[field] = False
+        supplied_duration = raw.get('user_duration')
+        if supplied_duration is not None:
+            try:
+                raw['user_duration'] = DurationInput.model_validate(
+                    supplied_duration,
+                ).model_dump(exclude_none=True)
+            except (ValidationError, TypeError, ValueError):
+                # An invalid optional duration must not make an otherwise valid
+                # command unusable or become a fabricated user fact.
+                raw.pop('user_duration', None)
         if 'selected_candidate' in raw and 'selected_candidate_number' not in raw:
             raw['selected_candidate_number'] = raw['selected_candidate']
         action_aliases = {
@@ -824,11 +1052,29 @@ class LLMOperationInterpreter:
         turn_aliases = {
             'новая': 'new', 'новый': 'new', 'продолжение': 'continue',
             'подтверждение': 'confirm', 'отказ': 'reject', 'отмена': 'abandon',
+            'исправление': 'correction', 'коррекция': 'correction',
         }
         if isinstance(raw.get('turn'), str):
             value = raw['turn'].lower().replace('ё', 'е').strip()
             raw['turn'] = turn_aliases.get(value, value)
-        return Proposal.model_validate(raw)
+        for field in ('date', 'target_date'):
+            if field in raw:
+                raw[field] = normalize_date_payload(raw[field])
+        for field in ('time', 'target_time'):
+            if field in raw:
+                raw[field] = normalize_time_payload(raw[field])
+        # Unknown provider-specific keys carry no authority. Dropping them is
+        # safer and more compatible than failing the complete operation.
+        allowed = set(Proposal.model_fields)
+        raw = {key: value for key, value in raw.items() if key in allowed}
+        try:
+            return Proposal.model_validate(raw)
+        except ValidationError as error:
+            logger.warning(
+                'Invalid proposal fields: %s',
+                [(item['loc'], item['type']) for item in error.errors()],
+            )
+            raise
 
     @staticmethod
     def _kind(value):

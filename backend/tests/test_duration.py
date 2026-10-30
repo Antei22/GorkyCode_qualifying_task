@@ -6,7 +6,7 @@ from unittest.mock import Mock
 from uuid import uuid4
 
 from app.assistant.tools import Tools
-from app.domain.duration import duration_request
+from app.domain.duration import duration_request, parse_user_duration
 from app.domain.models import RecordDraft
 from app.domain.time import Clock
 from app.service import Service
@@ -14,6 +14,27 @@ from app.storage.repository import Repository
 
 
 class DurationIntentTests(unittest.TestCase):
+    def test_user_duration_precision_is_preserved(self):
+        exact = parse_user_duration('Встреча на 2 часа')
+        approximate = parse_user_duration('Встреча примерно на 2 часа')
+        colloquial = parse_user_duration('Встреча часа два')
+        ranged = parse_user_duration('Встреча на час-два')
+        qualitative = parse_user_duration('Встреча будет недолго')
+        self.assertEqual((exact['type'], exact['minutes']), ('exact', 120))
+        self.assertEqual(
+            (approximate['type'], approximate['minutes']), ('approximate', 120),
+        )
+        self.assertEqual(
+            (colloquial['type'], colloquial['minutes']), ('approximate', 120),
+        )
+        self.assertEqual(
+            (ranged['type'], ranged['min_minutes'], ranged['max_minutes']),
+            ('range', 60, 120),
+        )
+        self.assertEqual(
+            (qualitative['type'], qualitative['value']), ('qualitative', 'short'),
+        )
+
     def test_change_and_question_never_authorize_cancellation(self):
         repo, con = Mock(), Mock()
         for message in ('Исправь что встреча с марией будет длится долго',

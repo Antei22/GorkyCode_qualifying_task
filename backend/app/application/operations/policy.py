@@ -113,7 +113,9 @@ class DefaultOperationPolicy:
                 missing.append('scheduled_date')
             if final.scheduled_time is None:
                 missing.append('scheduled_time')
-        if final.kind == 'meeting' and final.duration.minutes is None:
+        if (final.kind == 'meeting'
+                and (final.duration_status == 'missing'
+                     or final.duration.minutes is None)):
             missing.append('duration')
         if final.scheduled_time is not None and final.scheduled_date is None:
             missing.append('scheduled_date')

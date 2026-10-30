@@ -3,7 +3,11 @@ import os
 from datetime import date, time
 from pathlib import Path
 from app.domain.models import DomainError
-from app.domain.time import Clock, parse_day, parse_time, period_bounds, schedule
+from app.domain.time import (
+    AbsoluteDate, Clock, MonthDayDate, ParsedTime, PeriodDate, RelativeDate,
+    WeekdayDate, parse_day, parse_time, period_bounds, resolve_date,
+    resolve_time, schedule, normalize_date_payload,
+)
 from app.ingestion.csv_import import read_csv
 
 
@@ -16,6 +20,51 @@ class TimeTests(unittest.TestCase):
         self.assertEqual(parse_day('послезавтра', self.now), date(2026, 10, 29))
         self.assertEqual(parse_day('в пятницу', self.now), date(2026, 10, 30))
         self.assertEqual(parse_day('до конца недели', self.now), date(2026, 11, 1))
+
+    def test_structured_date_resolution(self):
+        self.assertEqual(resolve_date(AbsoluteDate(
+            type='absolute', year=2026, month=11, day=20,
+            evidence='20.11.2026',
+        ), self.now), date(2026, 11, 20))
+        self.assertEqual(resolve_date(RelativeDate(
+            type='relative', days_offset=1, evidence='завтра',
+        ), self.now), date(2026, 10, 28))
+
+        self.assertEqual(resolve_date(MonthDayDate(
+            type='month_day', month=10, day=31, evidence='31 октября',
+        ), self.now), date(2026, 10, 31))
+        self.assertEqual(resolve_date(WeekdayDate(
+            type='weekday', weekday=4, week_offset=1,
+            evidence='в следующую пятницу',
+        ), self.now), date(2026, 11, 6))
+        self.assertEqual(resolve_date(PeriodDate(
+            type='end_of_period', period='week', period_offset=0,
+            evidence='в конце недели',
+        ), self.now), date(2026, 11, 1))
+        self.assertEqual(resolve_time(ParsedTime(
+            hour=10, minute=0, evidence='в 10:00',
+        )), time(10, 0))
+        self.assertEqual(resolve_time(ParsedTime(
+            type='absolute', hour=10, minute=0, evidence='10',
+        )), time(10, 0))
+        with self.assertRaises(DomainError):
+            resolve_date(AbsoluteDate(
+                type='absolute', year=2026, month=2, day=30,
+            ), self.now)
+
+    def test_malformed_relative_payload_is_normalized_from_evidence(self):
+        self.assertEqual(normalize_date_payload({
+            'type': 'relative', 'year': None,
+            'resolution': 'nearest_future', 'evidence': 'на завтра',
+        }), {
+            'type': 'relative', 'days_offset': 1, 'evidence': 'на завтра',
+        })
+
+    def test_structured_month_day_skips_invalid_leap_year(self):
+        end_of_year = Clock(fixed_now='2026-12-31T12:00:00+03:00').now()
+        self.assertEqual(resolve_date(MonthDayDate(
+            type='month_day', month=2, day=29,
+        ), end_of_year), date(2028, 2, 29))
 
     def test_next_weekday_and_end_of_month(self):
         self.assertEqual(parse_day('в следующую пятницу', self.now), date(2026, 11, 6))

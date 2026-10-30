@@ -6,7 +6,7 @@ planning and policy checks may produce an executable plan.
 from datetime import date, datetime, time
 from enum import Enum
 from hashlib import sha256
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -16,6 +16,9 @@ from .models import Kind
 
 OperationField = Literal[
     'kind', 'text', 'date_expression', 'time_expression', 'timezone', 'duration',
+]
+DurationStatus = Literal[
+    'missing', 'provided', 'declined_to_specify', 'defaulted',
 ]
 
 
@@ -37,6 +40,7 @@ class TurnKind(str, Enum):
     CONFIRM = 'confirm'
     REJECT = 'reject'
     ABANDON = 'abandon'  # Discard the pending operation, not the saved record.
+    CORRECTION = 'correction'
     UNKNOWN = 'unknown'
 
 
@@ -51,14 +55,46 @@ class Phase(str, Enum):
 
 
 class DurationInput(Contract):
-    """User-supplied precision; the interpreter cannot assign an internal estimate."""
+    """What the user actually said, without calendar-policy estimates."""
+    type: Literal['exact', 'approximate', 'range', 'qualitative'] | None = None
     minutes: int | None = Field(default=None, ge=5, le=480)
+    min_minutes: int | None = Field(default=None, ge=5, le=480)
+    max_minutes: int | None = Field(default=None, ge=5, le=480)
+    value: Literal['long', 'short'] | None = None
+    evidence: str | None = None
+    # Compatibility input for pending states created before user_duration.
     description: str | None = None
+
+    @model_validator(mode='after')
+    def validate_shape(self):
+        kind = self.type
+        if kind is None:
+            if self.minutes is not None:
+                kind = 'exact'
+                object.__setattr__(self, 'type', kind)
+            elif self.description:
+                kind = 'qualitative'
+                object.__setattr__(self, 'type', kind)
+                object.__setattr__(self, 'value', self.value or 'long')
+        if kind in {'exact', 'approximate'} and self.minutes is None:
+            raise ValueError(f'{kind} duration requires minutes')
+        if kind == 'range':
+            if self.min_minutes is None or self.max_minutes is None:
+                raise ValueError('range duration requires both bounds')
+            if self.min_minutes > self.max_minutes:
+                raise ValueError('duration range is reversed')
+        if kind == 'qualitative' and self.value is None:
+            raise ValueError('qualitative duration requires value')
+        return self
 
 
 class DurationValue(DurationInput):
-    """Stored/planned duration. A user-supplied plan is not measured elapsed time."""
+    """Technical calendar blocking retained under the legacy field name."""
     source: Literal['user', 'estimated', 'unknown'] = 'unknown'
+    blocking_source: Literal[
+        'user_exact', 'user_approximate', 'user_range_max',
+        'qualitative_default', 'event_type_default', 'legacy_unknown',
+    ] = 'legacy_unknown'
 
 
 class RecordPatch(Contract):
@@ -87,6 +123,9 @@ class TargetQuery(Contract):
 
 class OperationIntent(Contract):
     action: Action = Action.UNKNOWN
+    # Original command and source excerpts survive while a clarification is pending.
+    source_text: str | None = None
+    field_evidence: dict[str, str] = Field(default_factory=dict)
     target: TargetQuery = Field(default_factory=TargetQuery)
     changes: RecordPatch = Field(default_factory=RecordPatch)
     read_fields: tuple[str, ...] = ()
@@ -119,6 +158,8 @@ class RecordSnapshot(Contract):
     scheduled_date: date | None
     scheduled_time: time | None
     timezone: str
+    user_duration: DurationInput | None = None
+    duration_status: DurationStatus = 'defaulted'
     duration: DurationValue = Field(default_factory=DurationValue)
     status: Literal['open', 'done', 'cancelled']
     revision: str  # Server adapter derives this from updated_at/version.
@@ -181,6 +222,13 @@ class PolicyDecision(Contract):
         return self
 
 
+class PendingChange(Contract):
+    """A conflicting patch value awaiting an explicit yes/no decision."""
+    field: OperationField
+    old_value: Any
+    new_value: Any
+
+
 class PendingOperation(Contract):
     """Versioned replacement for creation-only drafts; persistence adapter is TODO."""
     schema_version: Literal[1] = 1
@@ -191,6 +239,7 @@ class PendingOperation(Contract):
     selected_record_id: UUID | None = None
     proposed_plan: ChangePlan | None = None
     confirmed_fingerprint: str | None = None
+    pending_changes: tuple[PendingChange, ...] = ()
     created_at: datetime
     updated_at: datetime
     expires_at: datetime

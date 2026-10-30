@@ -17,9 +17,11 @@ from app.storage.operation_adapters import (
 
 
 class Service:
-    def __init__(self, repo, assistant, clock, operation_interpreter=None):
+    def __init__(self, repo, assistant, clock, operation_interpreter=None,
+                 hybrid_search=None):
         self.repo, self.assistant, self.clock = repo, assistant, clock
         self.operation_interpreter = operation_interpreter
+        self.hybrid_search = hybrid_search
         self.operation_presenter = DefaultOutcomePresenter()
 
     @staticmethod
@@ -105,7 +107,9 @@ class Service:
                 now=self.clock.now(),
                 history=tuple((row['role'], row['content']) for row in history_rows),
             )
-            resolver = PostgresTargetResolver(self.repo, con)
+            resolver = PostgresTargetResolver(
+                self.repo, con, hybrid_search=self.hybrid_search,
+            )
             planner = DefaultChangePlanner()
             policy = CalendarOperationPolicy(self.repo, con)
             executor = PostgresOperationExecutor(self.repo, con)
@@ -142,6 +146,13 @@ class Service:
 
     @staticmethod
     def _snapshot_payload(item):
+        from datetime import datetime, timedelta
+        reserved_until = None
+        if (item.scheduled_date is not None and item.scheduled_time is not None
+                and item.duration.minutes is not None):
+            reserved_until = datetime.combine(
+                item.scheduled_date, item.scheduled_time,
+            ) + timedelta(minutes=item.duration.minutes)
         return {
             'id': item.id, 'kind': item.kind, 'text': item.text,
             'scheduled_date': item.scheduled_date,
@@ -149,6 +160,12 @@ class Service:
             'duration_minutes': item.duration.minutes,
             'duration_source': item.duration.source,
             'duration_description': item.duration.description,
+            'user_duration': (item.user_duration.model_dump(mode='json', exclude_none=True)
+                              if item.user_duration else None),
+            'duration_status': item.duration_status,
+            'blocking_duration_minutes': item.duration.minutes,
+            'blocking_duration_source': item.duration.blocking_source,
+            'reserved_until': reserved_until,
             'timezone': item.timezone, 'status': item.status,
             'version': item.revision,
         }

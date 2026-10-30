@@ -9,7 +9,7 @@ from app.application.operations import (
 )
 from app.application.operations.codec import dump_pending, load_pending
 from app.application.operations.ports import TurnContext
-from app.application.operations.state import merge_intent
+from app.application.operations.state import merge_intent, merge_patch
 from app.domain.operations import (
     Action, DurationInput, DurationValue, ExecutionResult, Interpretation,
     OperationIntent, PendingOperation, Phase, RecordPatch, RecordSnapshot,
@@ -117,6 +117,53 @@ def coordinator(interpreter, resolver=None, planner=None, executor=None, policy=
 
 
 class OperationStateTests(unittest.TestCase):
+    def test_patch_merge_keeps_safe_fields_and_collects_conflict(self):
+        previous = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='meeting', text='Встреча', time_expression='10:00',
+            ),
+        )
+        current = OperationIntent(changes=RecordPatch(
+            date_expression='2026-10-29', time_expression='11:00',
+            duration=DurationInput(minutes=60),
+        ))
+        merged, accepted, same, conflicts = merge_patch(previous, current)
+        self.assertEqual(
+            accepted, ('date_expression', 'duration'),
+        )
+        self.assertEqual(same, ())
+        self.assertEqual(merged.changes.date_expression, '2026-10-29')
+        self.assertEqual(merged.changes.duration.minutes, 60)
+        self.assertEqual(merged.changes.time_expression, '10:00')
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].field, 'time_expression')
+        self.assertEqual(conflicts[0].new_value, '11:00')
+
+    def test_patch_merge_treats_equal_value_as_same_and_correction_overwrites(self):
+        previous = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(time_expression='10:00'),
+        )
+        equal, accepted, same, conflicts = merge_patch(
+            previous,
+            OperationIntent(changes=RecordPatch(time_expression='10:00')),
+        )
+        self.assertEqual(equal.changes.time_expression, '10:00')
+        self.assertEqual(accepted, ())
+        self.assertEqual(same, ('time_expression',))
+        self.assertEqual(conflicts, ())
+
+        corrected, accepted, same, conflicts = merge_patch(
+            previous,
+            OperationIntent(changes=RecordPatch(time_expression='11:00')),
+            allow_overwrite=True,
+        )
+        self.assertEqual(corrected.changes.time_expression, '11:00')
+        self.assertEqual(accepted, ('time_expression',))
+        self.assertEqual(same, ())
+        self.assertEqual(conflicts, ())
+
     def test_merge_preserves_omitted_fields_and_explicit_null(self):
         first = OperationIntent(
             action=Action.UPDATE,
@@ -249,6 +296,73 @@ class OperationStateTests(unittest.TestCase):
         self.assertEqual(second.phase, Phase.COMPLETED)
         self.assertEqual(second.records[0].text, 'Встреча с Марией')
         self.assertEqual(second.records[0].duration.minutes, 90)
+
+    def test_conflicting_follow_up_requires_confirmation_and_keeps_safe_date(self):
+        initial = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='reminder', text='увидеться с Саней',
+                time_expression='10:00',
+            ),
+        )
+        patch = OperationIntent(changes=RecordPatch(
+            date_expression='2026-10-29', time_expression='11:00',
+        ))
+        flow = coordinator(Interpreter(
+            Interpretation(turn=TurnKind.NEW, intent=initial),
+            Interpretation(turn=TurnKind.CONTINUE, intent=patch),
+            Interpretation(turn=TurnKind.CONFIRM),
+        ))
+        waiting = flow.handle(context(), None)
+        self.assertEqual(waiting.phase, Phase.NEED_FIELDS)
+
+        conflict = flow.handle(
+            context(NOW + timedelta(minutes=1)), waiting.pending,
+        )
+        self.assertEqual(conflict.phase, Phase.NEED_CONFIRMATION)
+        self.assertEqual(
+            conflict.pending.intent.changes.date_expression, '2026-10-29',
+        )
+        self.assertEqual(
+            conflict.pending.intent.changes.time_expression, '10:00',
+        )
+        self.assertEqual(
+            conflict.pending.pending_changes[0].field, 'time_expression',
+        )
+
+        completed = flow.handle(
+            context(NOW + timedelta(minutes=2)), conflict.pending,
+        )
+        self.assertEqual(completed.phase, Phase.COMPLETED)
+        self.assertEqual(completed.records[0].scheduled_date, date(2026, 10, 29))
+        self.assertEqual(completed.records[0].scheduled_time, time(11, 0))
+
+    def test_rejected_conflict_keeps_old_value_and_safe_patch(self):
+        initial = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='reminder', text='увидеться с Саней',
+                time_expression='10:00',
+            ),
+        )
+        patch = OperationIntent(changes=RecordPatch(
+            date_expression='2026-10-29', time_expression='11:00',
+        ))
+        flow = coordinator(Interpreter(
+            Interpretation(turn=TurnKind.NEW, intent=initial),
+            Interpretation(turn=TurnKind.CONTINUE, intent=patch),
+            Interpretation(turn=TurnKind.REJECT),
+        ))
+        waiting = flow.handle(context(), None)
+        conflict = flow.handle(
+            context(NOW + timedelta(minutes=1)), waiting.pending,
+        )
+        completed = flow.handle(
+            context(NOW + timedelta(minutes=2)), conflict.pending,
+        )
+        self.assertEqual(completed.phase, Phase.COMPLETED)
+        self.assertEqual(completed.records[0].scheduled_date, date(2026, 10, 29))
+        self.assertEqual(completed.records[0].scheduled_time, time(10, 0))
 
     def test_invalid_date_becomes_clarification_and_can_be_corrected(self):
         zoned_now = NOW.astimezone(ZoneInfo('Europe/Moscow'))
@@ -448,6 +562,81 @@ class OperationStateTests(unittest.TestCase):
         )
         self.assertEqual(plan.after.duration.minutes, 60)
         self.assertEqual(plan.after.duration.source, 'estimated')
+        self.assertIsNone(plan.after.user_duration)
+        self.assertEqual(plan.after.duration_status, 'declined_to_specify')
+        self.assertEqual(
+            plan.after.duration.blocking_source, 'event_type_default',
+        )
+
+    def test_default_blocking_does_not_suppress_duration_question(self):
+        intent = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='meeting', text='Встреча с мамой',
+                date_expression='завтра', time_expression='10:00',
+            ),
+        )
+        zoned = context(NOW.astimezone(ZoneInfo('Europe/Moscow')))
+        planner = DefaultChangePlanner()
+        plan = planner.prepare(zoned, intent, None)
+        self.assertIsNone(plan.after.user_duration)
+        self.assertEqual(plan.after.duration.minutes, 60)
+        self.assertEqual(plan.after.duration_status, 'missing')
+        decision = DefaultOperationPolicy().evaluate(zoned, intent, plan, None)
+        self.assertEqual(decision.phase, Phase.NEED_FIELDS)
+        self.assertEqual(decision.missing_fields[0], 'duration')
+        self.assertEqual(decision.question, 'Сколько будет длиться встреча?')
+
+    def test_declined_duration_accepts_default_without_question_loop(self):
+        initial = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='meeting', text='Встреча с мамой',
+                date_expression='завтра', time_expression='10:00',
+            ),
+        )
+        declined = OperationIntent(unknown_fields=('duration',))
+        executor = Executor()
+        flow = coordinator(
+            Interpreter(
+                Interpretation(turn=TurnKind.NEW, intent=initial),
+                Interpretation(turn=TurnKind.CONTINUE, intent=declined),
+            ),
+            planner=DefaultChangePlanner(), executor=executor,
+        )
+        zoned_now = NOW.astimezone(ZoneInfo('Europe/Moscow'))
+        waiting = flow.handle(context(zoned_now), None)
+        self.assertEqual(waiting.phase, Phase.NEED_FIELDS)
+        done = flow.handle(
+            context(zoned_now + timedelta(minutes=1)), waiting.pending,
+        )
+        self.assertEqual(done.phase, Phase.COMPLETED)
+        self.assertEqual(done.records[0].duration_status, 'declined_to_specify')
+        self.assertEqual(done.records[0].duration.minutes, 60)
+
+    def test_duration_range_blocks_upper_bound_without_losing_range(self):
+        intent = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='meeting', text='Встреча с мамой',
+                date_expression='завтра', time_expression='10:00',
+                duration=DurationInput(
+                    type='range', min_minutes=60, max_minutes=120,
+                    evidence='час-два',
+                ),
+            ),
+        )
+        plan = DefaultChangePlanner().prepare(
+            context(NOW.astimezone(ZoneInfo('Europe/Moscow'))), intent, None,
+        )
+        self.assertEqual(plan.after.user_duration.type, 'range')
+        self.assertEqual(plan.after.user_duration.min_minutes, 60)
+        self.assertEqual(plan.after.user_duration.max_minutes, 120)
+        self.assertEqual(plan.after.duration_status, 'provided')
+        self.assertEqual(plan.after.duration.minutes, 120)
+        self.assertEqual(
+            plan.after.duration.blocking_source, 'user_range_max',
+        )
 
     def test_unknown_required_date_gets_explanatory_clarification(self):
         intent = OperationIntent(

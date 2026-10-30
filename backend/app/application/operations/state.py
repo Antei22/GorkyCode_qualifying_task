@@ -1,6 +1,7 @@
 """Pure state helpers for the unified operation dialogue."""
 from app.domain.operations import (
-    Action, OperationIntent, PendingOperation, RecordPatch, TargetQuery,
+    Action, OperationIntent, PendingChange, PendingOperation, RecordPatch,
+    TargetQuery,
 )
 
 
@@ -58,6 +59,8 @@ def merge_intent(previous: OperationIntent,
         change_values.pop(field, None)
     return OperationIntent(
         action=action,
+        source_text=previous.source_text or current.source_text,
+        field_evidence={**previous.field_evidence, **current.field_evidence},
         target=_overlay(previous.target, current.target, TargetQuery),
         changes=RecordPatch.model_validate(change_values),
         read_fields=read_fields,
@@ -68,6 +71,49 @@ def merge_intent(previous: OperationIntent,
         # A request for another slot belongs only to the current turn.
         alternative_requested=current.alternative_requested,
     )
+
+
+def merge_patch(previous: OperationIntent, current: OperationIntent | None,
+                allow_overwrite: bool = False):
+    """Accept empty/same fields and isolate differing draft values.
+
+    Values are already canonical by this boundary: dates are ISO dates, times are
+    HH:MM and durations are structured models. Equality is therefore semantic,
+    not a comparison of the original LLM JSON representation.
+    """
+    if current is None:
+        return previous, (), (), ()
+    previous_values = previous.changes.model_dump(exclude_unset=True, mode='json')
+    current_values = current.changes.model_dump(exclude_unset=True, mode='json')
+    accepted = {}
+    conflicts = []
+    same = []
+    for field, new_value in current_values.items():
+        if field not in previous_values or previous_values[field] is None:
+            accepted[field] = new_value
+        elif previous_values[field] == new_value:
+            same.append(field)
+        elif allow_overwrite:
+            accepted[field] = new_value
+        else:
+            conflicts.append(PendingChange(
+                field=field,
+                old_value=previous_values[field],
+                new_value=new_value,
+            ))
+    safe_current = current.model_copy(update={
+        'changes': RecordPatch.model_validate(accepted),
+    })
+    return (merge_intent(previous, safe_current), tuple(accepted), tuple(same),
+            tuple(conflicts))
+
+
+def apply_pending_changes(intent: OperationIntent,
+                          changes: tuple[PendingChange, ...]):
+    patch = RecordPatch.model_validate({
+        change.field: change.new_value for change in changes
+    })
+    return merge_intent(intent, OperationIntent(changes=patch))
 
 
 def pending_is_expired(pending: PendingOperation, now) -> bool:
