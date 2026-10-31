@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from openai import OpenAI
@@ -88,6 +89,13 @@ class Proposal(BaseModel):
     target_temporal: str | ParsedDate = 'unspecified'
     target_date: ParsedDate | None = None
     target_time: ParsedTime | None = None
+<<<<<<< Updated upstream
+=======
+    result_limit: int | None = Field(default=None, ge=1, le=100)
+    completion_status: Literal['completed', 'incomplete', 'any'] = 'any'
+    time_scope: Literal['future', 'past', 'any'] = 'any'
+    ordering_direction: Literal['asc', 'desc'] = 'asc'
+>>>>>>> Stashed changes
     kind: str | None = None
     semantic_class: Literal[
         'meeting_like', 'todo_like', 'reminder_like', 'info_query',
@@ -173,6 +181,13 @@ INSTRUCTIONS = '''Ты преобразуешь русскую реплику в
 Ты ничего не выполняешь и не утверждаешь, что данные сохранены.
 action: create, update, cancel, read, list или unknown. LIST — список записей по
 фильтрам без конкретного target_query; READ — поиск конкретной записи.
+<<<<<<< Updated upstream
+=======
+COMPLETE означает отметить существующую запись выполненной (open -> done), REOPEN — вернуть
+выполненную запись в активные (done -> open). Эти действия не меняют дату, текст, тип или
+длительность. Для cancel all_matches=true допустим при явном удалении/отмене всех найденных
+событий; для complete/reopen — только при явном «все», «всех», «каждую» или «каждый».
+>>>>>>> Stashed changes
 turn=new для самостоятельной новой команды; continue только для ответа на текущий
 вопрос; confirm только для явного подтверждения предложенного плана; abandon для
 отказа от незавершённого черновика. Изменение даты, времени, текста, типа или
@@ -198,11 +213,26 @@ mode:whole|until_end|from_start,evidence}. Диапазон дат возвра�
 temporal={type:date_range,start:{type:month_day,...},end:{type:month_day,...},evidence}.
 Для LIST заполняй target_kinds: встречи=[meeting], задачи=[task],
 напоминания=[reminder]; «что запланировано» не ограничивает тип.
+<<<<<<< Updated upstream
+=======
+Извлекай result_limit для явного количества («5», «пять», «две»). completion_status=
+completed, если пользователь называет записи выполненными, завершёнными, законченными
+или сделанными; incomplete, если они не выполнены, не завершены или ещё не сделаны;
+иначе any. Нормализуй смысл, а не конкретное слово. time_scope=
+future для ближайших/предстоящих, past для прошедших/последних, иначе any.
+Статус выполнения и временная область независимы: прошедшая запись не обязательно выполнена.
+ordering_direction=
+asc для ближайших/первых и desc для последних. Без явного количества result_limit=null.
+>>>>>>> Stashed changes
 Время возвращай как {type:absolute, hour, minute, evidence}. Если пользователь
 назвал только час, minute=0. Не ищи минуты среди соседних чисел. Числа внутри
 даты нельзя повторно использовать как час, минуты, длительность или другое поле.
 Один фрагмент исходной реплики нельзя использовать для двух полей, если значение
 не было явно названо дважды. Evidence даты и времени должны быть раздельными.
+В конструкции «в 11 на 2 часа» извлекай time=11:00 из «в 11» и duration=120 минут
+из «на 2 часа»: это два разных однозначных фрагмента.
+В напоминании «завтра в час» сначала трактуй «в час» как время напоминания 13:00;
+если роль фразы действительно неоднозначна, сохрани точную цитату как evidence.
 Примеры:
 "Создай встречу с мамой в 10 30.10.26" → date={type:absolute,year:2026,
 month:10,day:30,evidence:"30.10.26"}, time={type:absolute,hour:10,minute:0,
@@ -279,7 +309,8 @@ class LLMOperationInterpreter:
         self.client_factory = client_factory
 
     def interpret(self, context, pending: PendingOperation | None) -> Interpretation:
-        if pending is not None and pending.phase == Phase.NEED_CONFIRMATION:
+        if (pending is not None and pending.phase == Phase.NEED_CONFIRMATION
+                and not self._looks_like_confirmation_correction(context.message)):
             result = self._confirmation(context.message)
             context.trace.update({
                 'parser_used': result.parser_used,
@@ -287,6 +318,14 @@ class LLMOperationInterpreter:
                 'llm_output': None,
             })
             return result
+        calendar_continuation = self._calendar_continuation(context.message, pending)
+        if calendar_continuation is not None:
+            context.trace.update({
+                'parser_used': 'deterministic',
+                'calendar_continuation': 'next_day',
+                'llm_output': None,
+            })
+            return calendar_continuation
         deterministic = self._turn(context.message, pending)
         if deterministic is not None:
             context.trace.update({
@@ -342,6 +381,14 @@ class LLMOperationInterpreter:
             proposal = self._parse_proposal(calls[0].function.arguments)
         except (ValueError, TypeError, ValidationError) as error:
             raise DomainError('Модель вернула некорректный разбор операции.') from error
+<<<<<<< Updated upstream
+=======
+        llm_proposal = proposal
+        if proposal.action in (Action.CANCEL, Action.COMPLETE, Action.REOPEN):
+            proposal = proposal.model_copy(update={
+                'all_matches': proposal.all_matches and self._explicit_all_matches(context.message),
+            })
+>>>>>>> Stashed changes
         proposal = self._guard_current_temporal(context.message, proposal)
         proposal = self._guard_patch_evidence(context.message, proposal)
         proposal = self._normalize_list_action(context.message, proposal)
@@ -414,6 +461,27 @@ class LLMOperationInterpreter:
                 target_values['time_expression'] = resolve_time(
                     proposal.target_time,
                 ).isoformat(timespec='minutes')
+<<<<<<< Updated upstream
+=======
+            if proposal.result_limit is not None:
+                target_values['result_limit'] = proposal.result_limit
+            if proposal.completion_status != 'any':
+                target_values['completion_status'] = proposal.completion_status
+            if proposal.time_scope != 'any':
+                target_values['time_scope'] = proposal.time_scope
+            if proposal.ordering_direction != 'asc':
+                target_values['ordering_direction'] = proposal.ordering_direction
+            effective_action = (pending.intent.action if proposal.action == Action.UNKNOWN
+                                and pending is not None else proposal.action)
+            if effective_action in (Action.READ, Action.LIST, Action.UPDATE,
+                                    Action.CANCEL, Action.COMPLETE, Action.REOPEN):
+                person = extract_person_constraint(context.message)
+                if person:
+                    target_values['person'] = person
+                    label = re.search(r'\bс\s+([А-ЯЁ][а-яё-]+)\b', context.message)
+                    if label:
+                        target_values['person_label'] = label.group(1)
+>>>>>>> Stashed changes
             target = TargetQuery(**target_values)
             change_date = proposal.temporal or proposal.date
             change_values = {key: value for key, value in {
@@ -476,6 +544,11 @@ class LLMOperationInterpreter:
                                 if pending is not None
                                 and proposal.ambiguity_resolution
                                 in pending.intent.ambiguous_fields else None),
+            working_hours_override=bool(
+                pending is not None
+                and pending.calendar_clarification == 'working_window'
+                and proposal.time is not None
+            ),
         )
         if proposal.request_alternative:
             intent_values['alternative_requested'] = True
@@ -502,10 +575,60 @@ class LLMOperationInterpreter:
             },
             'target_kinds': list(intent.target.kinds),
             'target_query': intent.target.query,
+<<<<<<< Updated upstream
+=======
+            'person_filter': intent.target.person,
+            'person_label': intent.target.person_label,
+            'result_limit': intent.target.result_limit,
+            'completion_status': intent.target.completion_status,
+            'time_scope': intent.target.time_scope,
+            'ordering_direction': intent.target.ordering_direction,
+>>>>>>> Stashed changes
             'patch': intent.changes.model_dump(mode='json', exclude_unset=True),
         })
         return result
 
+<<<<<<< Updated upstream
+=======
+    @staticmethod
+    def _explicit_all_matches(message: str) -> bool:
+        value = message.lower().replace('ё', 'е')
+        return bool(re.search(r'\b(?:все|всех|всю|каждую|каждый|каждое|все\s+подходящ\w*)\b', value))
+
+    @staticmethod
+    def _looks_like_confirmation_correction(message: str) -> bool:
+        value = message.lower().replace('ё', 'е')
+        return bool(re.search(
+            r'\b(?:нет\s*,?\s*не|исправ|измени|перенеси|давай|лучше|не\s+в|не\s+на)\b',
+            value,
+        ))
+
+    @staticmethod
+    def _calendar_continuation(message, pending):
+        if (pending is None
+                or pending.calendar_clarification != 'working_window'
+                or pending.proposed_plan is None):
+            return None
+        value = message.lower().replace('ё', 'е').strip(' !.,?')
+        if value not in {'на следующий день', 'следующий день',
+                         'тогда на следующий день'}:
+            return None
+        day = pending.proposed_plan.after.scheduled_date
+        if day is None:
+            return None
+        return Interpretation(
+            turn=TurnKind.CORRECTION,
+            intent=OperationIntent(
+                action=Action.UNKNOWN,
+                changes=RecordPatch(
+                    date_expression=(day + timedelta(days=1)).isoformat(),
+                    time_expression='08:00',
+                ),
+            ),
+            parser_used='deterministic',
+        )
+
+>>>>>>> Stashed changes
     @classmethod
     def _needs_audit(cls, message, proposal, pending):
         """Use a second model pass only when the first pass may have lost data."""
@@ -690,7 +813,13 @@ class LLMOperationInterpreter:
         if expected in {'time_expression', 'duration'}:
             return False
         value = message.lower().replace('ё', 'е')
-        if LLMOperationInterpreter._time_duration_collision_match(value) is None:
+        collision = LLMOperationInterpreter._time_duration_collision_match(value)
+        if collision is None:
+            return False
+        # «в 11 на 2 часа» contains two different, explicit fragments: the
+        # first is a clock time and the second is a duration.
+        clock = re.search(r'\bв\s+\d{1,2}(?::[0-5]\d)?\b', value)
+        if clock is not None and clock.span() != collision.span():
             return False
         # A day part makes it a clock time; explicit duration language makes it
         # a duration.  Without either cue both readings remain possible.
@@ -954,7 +1083,56 @@ class LLMOperationInterpreter:
             r'\b(?:есть ли|какие|что запланировано|что у меня)\b', value,
         ))
         updates = {'target_kinds': tuple(kinds)} if kinds else {}
+<<<<<<< Updated upstream
         if proposal.action == Action.READ and broad:
+=======
+        explicitly_incomplete = bool(re.search(
+            r'\b(?:невыполн\w*|не\s+выполн\w*)\b', value,
+        ))
+        explicitly_completed = bool(
+            not explicitly_incomplete and re.search(r'\bвыполн\w*\b', value)
+        )
+        if explicitly_incomplete:
+            updates['completion_status'] = 'incomplete'
+        elif explicitly_completed:
+            updates['completion_status'] = 'completed'
+        number_words = {'один': 1, 'одна': 1, 'одно': 1, 'два': 2,
+                        'две': 2, 'три': 3, 'четыре': 4, 'пять': 5,
+                        'шесть': 6, 'семь': 7, 'восемь': 8, 'девять': 9,
+                        'десять': 10}
+        quantity = re.search(
+            r'\b(\d{1,3}|один|одна|одно|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\b',
+            value,
+        )
+        quantity_requested = bool(re.search(
+            r'\b(?:первые|последние|ближайшие|выведи|выведите|покажи|покажите)\s+'
+            r'(?:\d{1,3}|один|одна|одно|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\b',
+            value,
+        ))
+        if quantity and quantity_requested:
+            raw = quantity.group(1)
+            updates['result_limit'] = min(100, max(1, int(raw) if raw.isdigit()
+                                                    else number_words[raw]))
+        future_requested = bool(re.search(
+            r'\b(?:ближайш\w*|предстоящ\w*|предстоят|первых)\b', value,
+        ))
+        past_requested = bool(re.search(
+            r'\b(?:прошедш\w*|прошл\w*|последн\w*)\b', value,
+        ))
+        if future_requested:
+            updates.update({'time_scope': 'future', 'ordering_direction': 'asc'})
+            if not explicitly_completed and not explicitly_incomplete:
+                updates['completion_status'] = 'incomplete'
+        elif past_requested:
+            updates.update({'time_scope': 'past', 'ordering_direction': 'desc',
+                            'completion_status': 'any'})
+        elif proposal.action in {Action.READ, Action.LIST}:
+            updates.setdefault('time_scope', 'any')
+        filtered_list = (explicitly_completed or explicitly_incomplete
+                         or proposal.completion_status != 'any'
+                         or future_requested or past_requested)
+        if proposal.action == Action.READ and (broad or filtered_list):
+>>>>>>> Stashed changes
             updates.update({'action': Action.LIST, 'target_query': None})
         return proposal.model_copy(update=updates) if updates else proposal
 
@@ -1229,6 +1407,17 @@ class LLMOperationInterpreter:
             set(pending.intent.kind_candidates) if pending is not None
             and pending.intent.kind_candidates else {'meeting', 'reminder'}
         )
+        if (pending is not None
+                and pending.calendar_clarification == 'working_window'
+                and (proposal.date is not None or proposal.temporal is not None
+                     or proposal.time is not None)):
+            return proposal.model_copy(update={
+                'turn': TurnKind.CORRECTION, 'action': Action.UNKNOWN,
+                'target_query': None, 'target_kind': None, 'target_kinds': (),
+                'target_temporal': 'unspecified', 'target_date': None,
+                'target_time': None, 'read_fields': (),
+                'request_alternative': False, 'selected_candidate_number': None,
+            })
         if (pending is not None and 'kind' in pending.intent.ambiguous_fields
                 and cls._kind(proposal.kind) in allowed_kinds):
             selected_kind = cls._kind(proposal.kind)
@@ -1271,6 +1460,20 @@ class LLMOperationInterpreter:
                               'time_expression', 'timezone'} and stored:
                 updates[selected] = stored
             return proposal.model_copy(update=updates)
+        if (pending is not None and pending.phase == Phase.NEED_CONFIRMATION
+                and proposal.turn == TurnKind.CORRECTION
+                and any(value is not None for value in (
+                    proposal.kind, proposal.text, proposal.date, proposal.temporal,
+                    proposal.time, proposal.timezone, proposal.duration_minutes,
+                    proposal.duration_description, proposal.user_duration,
+                ))):
+            return proposal.model_copy(update={
+                'turn': TurnKind.CORRECTION, 'action': Action.UNKNOWN,
+                'target_query': None, 'target_kind': None, 'target_kinds': (),
+                'target_temporal': 'unspecified', 'target_date': None,
+                'target_time': None, 'read_fields': (),
+                'request_alternative': False, 'selected_candidate_number': None,
+            })
         if (pending is not None and pending.phase == Phase.NEED_CONFIRMATION
                 and proposal.request_alternative):
             return proposal.model_copy(update={

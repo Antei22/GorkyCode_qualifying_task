@@ -104,6 +104,17 @@ class Repository:
              query, query, query, now, now, now, limit)).fetchall()
 
     @staticmethod
+    def get_records_by_ids(con, owner, record_ids, statuses=None):
+        rows = con.execute('''SELECT * FROM records
+            WHERE owner_id=%s AND id=ANY(%s::uuid[])
+              AND status <> 'cancelled'
+              AND (%s::text[] IS NULL OR status=ANY(%s::text[]))''',
+            (owner, list(record_ids), list(statuses) if statuses else None,
+             list(statuses) if statuses else None)).fetchall()
+        order = {str(record_id): index for index, record_id in enumerate(record_ids)}
+        return sorted(rows, key=lambda row: order.get(str(row['id']), len(order)))
+
+    @staticmethod
     def update_record(con, owner, record_id, expected_version, draft):
         fields = draft.model_dump()
         return con.execute('''UPDATE records SET kind=%s, text=%s,
@@ -143,10 +154,22 @@ class Repository:
 
     @staticmethod
     def list_records(con, owner, first=None, last=None, kind=None, limit=100,
+<<<<<<< Updated upstream
                      now=None, kinds=None):
         now = now or datetime.now()
         today, current_time = now.date(), now.time().replace(tzinfo=None)
         return con.execute('''SELECT records.*,
+=======
+                     now=None, kinds=None, temporal='all', order_direction='asc',
+                     completion_status='any'):
+        now = now or datetime.now()
+        today, current_time = now.date(), now.time().replace(tzinfo=None)
+        status_filter = {
+            'completed': 'done',
+            'incomplete': 'open',
+        }.get(completion_status)
+        rows = con.execute('''SELECT records.*,
+>>>>>>> Stashed changes
             duration_minutes AS blocking_duration_minutes,
             CASE WHEN scheduled_date IS NOT NULL AND scheduled_time IS NOT NULL
                       AND duration_minutes IS NOT NULL
@@ -157,6 +180,16 @@ class Repository:
             AND (%s::date IS NULL OR scheduled_date <= %s)
             AND (%s::text IS NULL OR kind=%s)
             AND (%s::text[] IS NULL OR kind=ANY(%s::text[]))
+            AND (%s::text IS NULL OR status=%s)
+            AND (
+                %s::text = 'all'
+                OR (%s::text = 'future' AND scheduled_date IS NOT NULL AND
+                    (scheduled_date > %s OR (scheduled_date=%s AND
+                     (scheduled_time IS NULL OR scheduled_time >= %s))))
+                OR (%s::text = 'past' AND scheduled_date IS NOT NULL AND
+                    (scheduled_date < %s OR (scheduled_date=%s AND
+                     scheduled_time IS NOT NULL AND scheduled_time < %s)))
+            )
             ORDER BY
                 CASE
                     WHEN scheduled_date > %s OR (scheduled_date=%s AND (scheduled_time IS NULL OR scheduled_time >= %s)) THEN 0
@@ -170,9 +203,22 @@ class Repository:
                 id LIMIT %s''',
             (owner, first, first, last, last, kind, kind,
              list(kinds) if kinds else None, list(kinds) if kinds else None,
+             status_filter, status_filter,
+             temporal, temporal, today, today, current_time,
+             temporal, today, today, current_time,
              today, today, current_time, today, today, current_time,
              today, today, current_time, today, today, current_time,
              today, today, current_time, limit)).fetchall()
+<<<<<<< Updated upstream
+=======
+        rows.sort(key=lambda row: (
+            row['scheduled_date'] is None,
+            row['scheduled_date'] or today,
+            row['scheduled_time'] or current_time,
+            row['id'],
+        ), reverse=order_direction == 'desc')
+        return rows[:limit]
+>>>>>>> Stashed changes
 
     @staticmethod
     def search(con, owner, query, kind=None, limit=20, now=None, future_only=False):
@@ -211,7 +257,10 @@ class Repository:
 
     @staticmethod
     def meetings_between(con, owner, first, last):
-        return con.execute('''SELECT * FROM records
+        return con.execute('''SELECT records.*,
+            scheduled_date + scheduled_time
+              + make_interval(mins => COALESCE(duration_minutes, 60)) AS reserved_until
+            FROM records
             WHERE owner_id=%s AND kind='meeting' AND status <> 'cancelled'
             AND scheduled_date BETWEEN %s AND %s AND scheduled_time IS NOT NULL
             ORDER BY scheduled_date, scheduled_time, id''',

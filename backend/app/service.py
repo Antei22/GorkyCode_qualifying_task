@@ -7,6 +7,10 @@ from fastapi.encoders import jsonable_encoder
 from app.assistant.tools import Tools
 from app.domain.models import DomainError
 from app.domain.duration import duration_request, explicit_duration
+from app.domain.operations import (
+    Action, Interpretation, OperationIntent, OperationOutcome, Phase,
+    TargetQuery, TurnKind,
+)
 from app.application.operations import (
     DefaultChangePlanner, DefaultOutcomePresenter, OperationCoordinator,
 )
@@ -19,6 +23,15 @@ from app.storage.operation_adapters import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class _StaticOperationInterpreter:
+    """Trusted server-side interpretation for continuation references."""
+    def __init__(self, interpretation):
+        self.interpretation = interpretation
+
+    def interpret(self, context, pending=None):
+        return self.interpretation
 
 
 class Service:
@@ -92,7 +105,7 @@ class Service:
     def _operation_chat(self, owner, request_id, message):
         with self.repo.connect() as con:
             session = con.execute(
-                'SELECT operation_state FROM sessions WHERE id=%s FOR UPDATE', (owner,)
+                'SELECT operation_state,list_state FROM sessions WHERE id=%s FOR UPDATE', (owner,)
             ).fetchone()
             if not session:
                 raise DomainError('Сессия не найдена. Обновите страницу.')
@@ -124,11 +137,64 @@ class Service:
             planner = DefaultChangePlanner()
             policy = CalendarOperationPolicy(self.repo, con)
             executor = PostgresOperationExecutor(self.repo, con)
+            list_state = session['list_state'] or None
+            normalized = message.strip().lower().replace('ё', 'е').strip(' !.,?')
+            chosen_interpreter = self.operation_interpreter
+            direct_outcome = None
+            if pending is None and normalized in {
+                    'покажи еще', 'еще', 'следующая страница', 'дальше',
+                    'следующие', 'следующие записи'} and list_state:
+                if list_state.get('next_cursor') is None:
+                    direct_outcome = OperationOutcome(
+                        phase=Phase.COMPLETED, question='Больше записей нет.',
+                    )
+                else:
+                    target = TargetQuery.model_validate(list_state['target']).model_copy(
+                        update={
+                            'page_offset': int(list_state['next_cursor']),
+                            'record_ids': tuple(list_state.get('all_record_ids') or ()),
+                        },
+                    )
+                    chosen_interpreter = _StaticOperationInterpreter(Interpretation(
+                        turn=TurnKind.NEW,
+                        intent=OperationIntent(
+                            action=Action.LIST, target=target,
+                            read_fields=tuple(list_state.get('read_fields') or ()),
+                        ),
+                        parser_used='deterministic',
+                    ))
+                    context.trace.update({
+                        'continuation_query_id': list_state.get('query_id'),
+                        'cursor_before': list_state.get('next_cursor'),
+                    })
+            elif (pending is None and normalized in {'удали их', 'удалить их'}
+                  and list_state and list_state.get('record_ids')):
+                target = TargetQuery(
+                    record_ids=tuple(list_state['record_ids']), temporal='all',
+                )
+                chosen_interpreter = _StaticOperationInterpreter(Interpretation(
+                    turn=TurnKind.NEW,
+                    intent=OperationIntent(
+                        action=Action.CANCEL, target=target, all_matches=True,
+                        source_text=message,
+                    ),
+                    parser_used='deterministic',
+                ))
+                context.trace['visible_result_ids'] = list_state['record_ids']
             coordinator = OperationCoordinator(
-                interpreter=self.operation_interpreter,
+                interpreter=chosen_interpreter,
                 resolver=resolver, planner=planner, policy=policy, executor=executor,
             )
+<<<<<<< Updated upstream
             outcome = coordinator.handle(context, pending)
+=======
+            outcome = direct_outcome or coordinator.handle(context, pending)
+            if outcome.execution is not None and outcome.execution.records:
+                record = outcome.execution.records[0]
+                self.repo.set_last_referenced(
+                    con, owner, record.id, record.kind,
+                )
+>>>>>>> Stashed changes
             state_payload = dump_pending(outcome.pending) if outcome.pending else None
             context.trace.update({
                 'pending_after': state_payload,
@@ -137,13 +203,48 @@ class Service:
                                 else context.trace.get('selected_id')),
                 'confirmation_decision': context.trace.get('confirmation_decision'),
             })
+            list_state_payload = list_state
+            if outcome.total_count is not None:
+                list_state_payload = {
+                    'query_id': context.trace.get('continuation_query_id') or str(request_id),
+                    'target': context.trace.get('list_target'),
+                    'read_fields': list(outcome.read_fields),
+                    'record_ids': [str(item.id) for item in outcome.records],
+                    'all_record_ids': context.trace.get('all_record_ids', []),
+                    'page_size': context.trace.get('page_size'),
+                    'returned_count': len(outcome.records),
+                    'total_count': outcome.total_count,
+                    'next_cursor': outcome.next_cursor,
+                }
+                context.trace['cursor_after'] = outcome.next_cursor
+                context.trace.update({
+                    'query_id': list_state_payload['query_id'],
+                    'shown_count': len(outcome.records),
+                    'total_count': outcome.total_count,
+                })
+            elif (outcome.phase == Phase.COMPLETED and outcome.execution is None
+                  and outcome.records):
+                visible_ids = [str(item.id) for item in outcome.records]
+                list_state_payload = {
+                    'query_id': str(request_id), 'target': None,
+                    'read_fields': list(outcome.read_fields),
+                    'record_ids': visible_ids, 'all_record_ids': visible_ids,
+                    'page_size': len(visible_ids),
+                    'returned_count': len(visible_ids),
+                    'total_count': len(visible_ids), 'next_cursor': None,
+                }
+            elif (outcome.execution is not None
+                  and outcome.execution.action == Action.CANCEL.value
+                  and context.trace.get('visible_result_ids')):
+                list_state_payload = None
             logger.info(
                 'operation_turn %s',
                 json.dumps(context.trace, ensure_ascii=False, default=str),
             )
             con.execute(
-                'UPDATE sessions SET operation_state=%s WHERE id=%s',
-                (Jsonb(state_payload) if state_payload else None, owner),
+                'UPDATE sessions SET operation_state=%s,list_state=%s WHERE id=%s',
+                (Jsonb(state_payload) if state_payload else None,
+                 Jsonb(list_state_payload) if list_state_payload else None, owner),
             )
             answer = self.operation_presenter.present(context, outcome)
             records = [self._snapshot_payload(item) for item in outcome.records]

@@ -11,13 +11,15 @@ from app.application.operations.codec import dump_pending, load_pending
 from app.application.operations.ports import TurnContext
 from app.application.operations.state import merge_intent, merge_patch
 from app.application.operations.confirmation import build_update_confirmation
+from app.application.operations.calendar_policy import CalendarOperationPolicy
 from app.domain.operations import (
     Action, DurationInput, DurationValue, ExecutionResult, Interpretation,
-    OperationIntent, PendingOperation, Phase, RecordPatch, RecordSnapshot,
+    OperationIntent, OperationOutcome, PendingOperation, Phase, RecordPatch, RecordSnapshot,
     TargetQuery, TargetResolution, TurnKind, make_change_plan,
 )
 from app.domain.time import DateRange, PeriodExpression
 from app.domain.text import clean_title
+from app.storage.operation_adapters import PostgresTargetResolver
 
 
 NOW = datetime.fromisoformat('2026-10-28T12:00:00+03:00')
@@ -173,6 +175,41 @@ class OperationStateTests(unittest.TestCase):
         self.assertEqual(result.phase, Phase.COMPLETED)
         self.assertEqual(result.records, (meeting,))
         self.assertEqual(planner.calls, [])
+
+    def test_bulk_delete_previews_and_executes_only_frozen_ids(self):
+        first = snapshot(text='событие с Анной 1')
+        second = snapshot(text='событие с Анной 2')
+        resolver = Resolver((first, second))
+        executor = Executor()
+        machine = coordinator(
+            Interpreter(Interpretation(
+                turn=TurnKind.NEW,
+                intent=OperationIntent(
+                    action=Action.CANCEL, all_matches=True,
+                    target=TargetQuery(query='с Анной'),
+                ),
+            )),
+            resolver=resolver, executor=executor,
+        )
+        preview = machine.handle(context(message='Удали все события с Анной'), None)
+        self.assertEqual(preview.phase, Phase.NEED_CONFIRMATION)
+        self.assertEqual(preview.records, (first, second))
+        self.assertEqual(
+            tuple(plan.before.id for plan in preview.pending.proposed_batch.plans),
+            (first.id, second.id),
+        )
+        # A later search result must not enter the already confirmed batch.
+        resolver.candidates += (snapshot(text='новое событие с Анной'),)
+        completed = machine.handle(context(message='да'), preview.pending)
+        self.assertEqual(
+            tuple(item.id for item in completed.records),
+            (first.id, second.id),
+        )
+        self.assertEqual(len(resolver.calls), 1)
+        answer = DefaultOutcomePresenter().present(context(), completed)
+        self.assertIn('Удалено 2 событий', answer)
+        self.assertIn('событие с Анной 1', answer)
+        self.assertIn('событие с Анной 2', answer)
 
     def test_patch_merge_keeps_safe_fields_and_collects_conflict(self):
         previous = OperationIntent(
@@ -1006,6 +1043,128 @@ class OperationStateTests(unittest.TestCase):
             clean_title('увидеться с Саней на на', 'увидеться с Саней на на'),
             'увидеться с Саней',
         )
+
+
+class CalendarSlotTests(unittest.TestCase):
+    def test_nearest_slot_starts_after_real_occupied_interval_on_weekend(self):
+        record_id = uuid4()
+
+        class Repository:
+            @staticmethod
+            def meetings_between(connection, owner, first, last):
+                return [{
+                    'id': record_id, 'text': 'занятая встреча',
+                    'scheduled_date': date(2026, 11, 1),
+                    'scheduled_time': time(11), 'duration_minutes': 120,
+                }]
+
+        policy = CalendarOperationPolicy(Repository(), object())
+        conflict, nearest, occupied, available_after = policy._nearest(
+            OWNER, datetime(2026, 11, 1, 11), 60, None,
+        )
+        self.assertEqual(conflict['id'], record_id)
+        self.assertEqual(nearest, datetime(2026, 11, 1, 13))
+        self.assertEqual(available_after, datetime(2026, 11, 1, 13))
+        self.assertEqual(occupied[0]['end'], '2026-11-01T13:00:00')
+
+    def test_slot_does_not_jump_to_next_day_when_duration_does_not_fit(self):
+        record_id = uuid4()
+
+        class Repository:
+            @staticmethod
+            def meetings_between(connection, owner, first, last):
+                return [{
+                    'id': record_id, 'text': 'Созвон с Альфой',
+                    'scheduled_date': date(2026, 11, 1),
+                    'scheduled_time': time(15), 'duration_minutes': 75,
+                }]
+
+        policy = CalendarOperationPolicy(Repository(), object())
+        conflict, nearest, _, available_after = policy._nearest(
+            OWNER, datetime(2026, 11, 1, 15), 120, None,
+        )
+        self.assertEqual(conflict['id'], record_id)
+        self.assertIsNone(nearest)
+        self.assertEqual(available_after, datetime(2026, 11, 1, 16, 15))
+
+        after = snapshot(
+            text='встреча с Дашей', day=date(2026, 11, 1),
+            clock=time(15), duration=120, revision='new',
+        )
+        intent = OperationIntent(
+            action=Action.CREATE,
+            changes=RecordPatch(
+                kind='meeting', text='встреча с Дашей',
+                date_expression='2026-11-01', time_expression='15:00',
+                duration={'type': 'exact', 'minutes': 120},
+                timezone='Europe/Moscow',
+            ),
+        )
+        decision = policy.evaluate(
+            context(), intent, make_change_plan('create', None, after), None,
+        )
+        self.assertEqual(decision.phase, Phase.NEED_FIELDS)
+        self.assertEqual(decision.calendar_clarification, 'working_window')
+        self.assertEqual(
+            decision.question,
+            ('В этот день свободное время есть только после 16:15 '
+             'или до 08:00. Когда вы хотите поставить встречу?'),
+        )
+
+
+class PaginationTests(unittest.TestCase):
+    def test_saved_cursor_returns_next_twenty_with_continued_numbering(self):
+        rows = [{
+            'id': uuid4(), 'kind': 'meeting', 'kind_source': 'user_input',
+            'text': f'встреча {index}', 'scheduled_date': date(2026, 11, 1),
+            'scheduled_end_date': None, 'scheduled_time': time(9),
+            'duration_minutes': 60, 'duration_source': 'user',
+            'duration_description': None, 'user_duration': None,
+            'duration_status': 'provided', 'blocking_duration_source': 'user_exact',
+            'timezone': 'Europe/Moscow', 'status': 'open', 'version': 1,
+        } for index in range(1, 46)]
+
+        class Repository:
+            @staticmethod
+            def list_records(*args, **kwargs):
+                return list(rows)
+
+            @staticmethod
+            def get_records_by_ids(connection, owner, record_ids, statuses=None):
+                by_id = {item['id']: item for item in rows}
+                return [by_id[item] for item in record_ids if item in by_id]
+
+            @staticmethod
+            def trace_search(*args, **kwargs):
+                return None
+
+        resolver = PostgresTargetResolver(Repository(), object())
+        first_context = context(message='Покажи все встречи')
+        intent = OperationIntent(
+            action=Action.LIST, target=TargetQuery(kinds=('meeting',)),
+        )
+        first = resolver.list(first_context, intent)
+        self.assertEqual(len(first.candidates), 20)
+        self.assertEqual(first.next_cursor, '20')
+
+        next_context = context(message='Покажи ещё')
+        next_intent = intent.model_copy(update={'target': intent.target.model_copy(
+            update={
+                'record_ids': tuple(item['id'] for item in rows),
+                'page_offset': int(first.next_cursor),
+            },
+        )})
+        second = resolver.list(next_context, next_intent)
+        self.assertEqual(len(second.candidates), 20)
+        self.assertEqual(second.candidates[0].text, 'встреча 21')
+        outcome = OperationOutcome(
+            phase=Phase.COMPLETED, records=second.candidates,
+            total_count=second.total_count, has_more=second.has_more,
+            next_cursor=second.next_cursor,
+        )
+        answer = DefaultOutcomePresenter().present(next_context, outcome)
+        self.assertIn('21. встреча 21', answer)
+        self.assertNotIn('1. встреча 1\n', answer)
 
 
 if __name__ == '__main__':

@@ -1,12 +1,20 @@
 """PostgreSQL adapters for the unified operation application layer."""
 from datetime import date, time, timedelta
+<<<<<<< Updated upstream
+=======
+import logging
+import re
+>>>>>>> Stashed changes
 from app.application.operations.ports import TurnContext
 from app.domain.models import DomainError, RecordDraft
 from app.domain.operations import (
-    DurationInput, DurationValue, ExecutionResult, OperationIntent, RecordSnapshot,
+    DEFAULT_PAGE_SIZE, DurationInput, DurationValue, ExecutionResult, OperationIntent, RecordSnapshot,
     TargetResolution,
 )
 from app.domain.time import parse_day, parse_time, resolve_temporal
+
+
+logger = logging.getLogger(__name__)
 
 
 def row_snapshot(row) -> RecordSnapshot:
@@ -45,6 +53,34 @@ class PostgresTargetResolver:
             )
             return TargetResolution(candidates=(row_snapshot(row),) if row else ())
         target = intent.target
+<<<<<<< Updated upstream
+=======
+        statuses = (('open',) if intent.action.value in {'complete', 'cancel'} else
+                    ('done',) if intent.action.value == 'reopen' else None)
+        if target.record_ids:
+            rows = self.repository.get_records_by_ids(
+                self.connection, context.owner_id, target.record_ids, statuses,
+            )
+            context.trace.update({
+                'search_stage': 'frozen_visible_results',
+                'candidate_ids': [str(row['id']) for row in rows],
+                'target_query': target.query,
+            })
+            return TargetResolution(
+                candidates=tuple(row_snapshot(row) for row in rows),
+            )
+        if self._is_this_reference(context.message):
+            last = self.repository.get_last_referenced(
+                self.connection, context.owner_id, target.kind,
+            )
+            if last is not None:
+                context.trace.update({
+                    'search_stage': 'last_referenced_record',
+                    'candidate_ids': [str(last['id'])],
+                    'selected_id': str(last['id']),
+                })
+                return TargetResolution(candidates=(row_snapshot(last),))
+>>>>>>> Stashed changes
         hard_kind = target.kind or (target.kinds[0] if len(target.kinds) == 1 else None)
         temporal_scope = target.temporal if isinstance(target.temporal, str) else 'unspecified'
         try:
@@ -62,7 +98,12 @@ class PostgresTargetResolver:
         rows = self.repository.resolve_records(
             self.connection, context.owner_id, query=target.query,
             kind=hard_kind, temporal=temporal_scope, day=day, moment=moment,
+<<<<<<< Updated upstream
             now=context.now, limit=21,
+=======
+            now=context.now, limit=(100000 if intent.all_matches else 21),
+            statuses=statuses,
+>>>>>>> Stashed changes
         )
         stage = 'lexical'
         if not rows and target.query and self.hybrid_search is not None:
@@ -101,10 +142,47 @@ class PostgresTargetResolver:
                 first = last = date.fromisoformat(target.date_expression)
             except ValueError:
                 first = last = parse_day(target.date_expression, context.now)
+<<<<<<< Updated upstream
         rows = self.repository.list_records(
             self.connection, context.owner_id, first, last,
             kind=target.kind, kinds=target.kinds, now=context.now,
         )
+=======
+        time_scope = target.time_scope
+        if time_scope == 'future' and (target.temporal == 'any' or
+                                       target.temporal == 'unspecified'):
+            temporal = 'future'
+        elif time_scope == 'past' and (target.temporal == 'any' or
+                                       target.temporal == 'unspecified'):
+            temporal = 'past'
+        elif isinstance(target.temporal, str) and target.temporal in {'future', 'past', 'all'}:
+            temporal = target.temporal
+        else:
+            temporal = 'all'
+        if target.record_ids:
+            rows = self.repository.get_records_by_ids(
+                self.connection, context.owner_id, target.record_ids,
+            )
+        else:
+            rows = self.repository.list_records(
+                self.connection, context.owner_id, first, last,
+                kind=target.kind, kinds=target.kinds, now=context.now,
+                temporal=temporal,
+                order_direction=target.ordering_direction,
+                completion_status=target.completion_status,
+                limit=100000,
+            )
+            if target.person:
+                rows = [row for row in rows if person_matches(target.person, row['text'])]
+        total_count = len(rows)
+        all_record_ids = [str(row['id']) for row in rows]
+        explicit = target.result_limit is not None
+        page_size = target.result_limit if explicit else DEFAULT_PAGE_SIZE
+        offset = target.page_offset if not explicit else 0
+        rows = rows[offset:offset + page_size]
+        has_more = (not explicit and offset + len(rows) < total_count)
+        next_cursor = str(offset + len(rows)) if has_more else None
+>>>>>>> Stashed changes
         self.repository.trace_search(
             self.connection, context, intent, None, 'list', rows,
         )
@@ -112,12 +190,38 @@ class PostgresTargetResolver:
             'search_stage': 'list',
             'candidate_ids': [str(row['id']) for row in rows[:100]],
             'target_kinds': list(target.kinds),
+            'completion_status': target.completion_status,
+            'time_scope': target.time_scope,
             'target_query': None,
+<<<<<<< Updated upstream
+=======
+            'person_filter': target.person,
+            'person_label': target.person_label,
+            'result_limit': target.result_limit,
+            'page_size': page_size,
+            'page_offset': offset,
+            'total_count': total_count,
+            'returned_count': len(rows),
+            'returned_ids': [str(row['id']) for row in rows],
+            'has_more': has_more,
+            'next_cursor': next_cursor,
+            'list_target': target.model_dump(mode='json'),
+            'all_record_ids': all_record_ids,
+>>>>>>> Stashed changes
             'normalized_temporal': {
                 'start': first.isoformat() if first else None,
                 'end_exclusive': ((last + timedelta(days=1)).isoformat()
                                   if last else None),
             },
+        })
+        logger.info('LIST filters=%s', {
+            'raw_text': context.message,
+            'target_kinds': list(target.kinds),
+            'completion_status': target.completion_status,
+            'time_scope': target.time_scope,
+            'temporal': intent.target.model_dump(mode='json').get('temporal'),
+            'result_limit': target.result_limit,
+            'returned_ids': [str(row['id']) for row in rows],
         })
         return TargetResolution(
             candidates=tuple(row_snapshot(row) for row in rows[:100]),

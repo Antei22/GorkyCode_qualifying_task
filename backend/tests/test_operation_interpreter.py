@@ -499,6 +499,33 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(result.intent.ambiguous_fields, ())
         self.assertEqual(result.intent.changes.duration.minutes, 240)
 
+    def test_separate_start_time_and_duration_are_not_ambiguous(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'meeting',
+            'text': 'встреча с Марией', 'date_expression': 'завтра',
+            'time_expression': '11:00', 'duration_minutes': 120,
+        })
+        result = adapter.interpret(
+            context('Назначь встречу с Марией завтра в 11 на 2 часа'), None,
+        )
+        self.assertEqual(result.intent.ambiguous_fields, ())
+        self.assertEqual(result.intent.changes.time_expression, '11:00')
+        self.assertEqual(result.intent.changes.duration.minutes, 120)
+
+    def test_reminder_at_one_oclock_is_parsed_as_time_without_explanation(self):
+        adapter, _ = self.interpreter({
+            'turn': 'new', 'action': 'create', 'kind': 'reminder',
+            'text': 'позвонить дизайнеру',
+            'date': {'type': 'relative', 'days_offset': 1,
+                     'evidence': 'завтра'},
+            'time': {'hour': 13, 'minute': 0, 'evidence': 'в час'},
+        })
+        result = adapter.interpret(
+            context('Создай напоминание. Позвонить дизайнеру завтра в час.'), None,
+        )
+        self.assertEqual(result.intent.ambiguous_fields, ())
+        self.assertEqual(result.intent.changes.time_expression, '13:00')
+
     def test_day_part_resolves_time_duration_collision_as_start_time(self):
         adapter, _ = self.interpreter({
             'turn': 'new', 'action': 'create', 'kind': 'meeting',
@@ -914,6 +941,60 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(confirmed.turn, TurnKind.CONFIRM)
         self.assertEqual(confirmed.confirmation_decision, 'confirm')
 
+    def test_confirmation_accepts_explicit_correction(self):
+        now = context('нет, давай в 16').now
+        record_id = uuid4()
+        before = RecordSnapshot(
+            id=record_id, kind='meeting', text='встреча с Дашей',
+            scheduled_date=now.date() + timedelta(days=1),
+            scheduled_time=now.time().replace(
+                hour=15, minute=0, second=0, microsecond=0, tzinfo=None,
+            ), timezone='Europe/Moscow', status='open', revision='1',
+        )
+        plan = make_change_plan('update', before, before.model_copy(update={
+            'scheduled_time': before.scheduled_time.replace(hour=17),
+        }))
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_CONFIRMATION,
+            intent=OperationIntent(action=Action.UPDATE), proposed_plan=plan,
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, client = self.interpreter({
+            'turn': 'correction', 'action': 'unknown',
+            'time_expression': '16:00',
+        })
+        result = adapter.interpret(context('нет, давай в 16'), pending)
+        self.assertEqual(result.turn, TurnKind.CORRECTION)
+        self.assertEqual(result.intent.changes.time_expression, '16:00')
+        self.assertEqual(len(client.requests), 1)
+
+    def test_working_window_next_day_is_relative_to_pending_date(self):
+        now = context('на следующий день').now
+        after = RecordSnapshot(
+            id=uuid4(), kind='meeting', text='встреча с Дашей',
+            scheduled_date=date(2026, 11, 1), scheduled_time=now.time().replace(
+                hour=15, minute=0, second=0, microsecond=0, tzinfo=None,
+            ), duration={'minutes': 120, 'source': 'user'},
+            timezone='Europe/Moscow', status='open', revision='new',
+        )
+        pending = PendingOperation(
+            operation_id=uuid4(), phase=Phase.NEED_FIELDS,
+            intent=OperationIntent(action=Action.CREATE),
+            proposed_plan=make_change_plan('create', None, after),
+            calendar_clarification='working_window',
+            created_at=now, updated_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        adapter, client = self.interpreter({
+            'turn': 'new', 'action': 'unknown',
+        })
+        result = adapter.interpret(context('на следующий день'), pending)
+        self.assertEqual(result.turn, TurnKind.CORRECTION)
+        self.assertEqual(result.intent.changes.date_expression, '2026-11-02')
+        self.assertEqual(result.intent.changes.time_expression, '08:00')
+        self.assertEqual(len(client.requests), 0)
+
     def test_list_guard_fixes_tomorrow_and_applies_meeting_kind(self):
         adapter, _ = self.interpreter({
             'turn': 'new', 'action': 'read',
@@ -952,6 +1033,31 @@ class InterpreterTests(unittest.TestCase):
                 result.intent.target.kinds,
                 (expected_kind,) if expected_kind else (),
             )
+
+    def test_list_completion_and_time_scope_are_independent(self):
+        cases = (
+            ('Покажи все выполненные встречи', 'completed', 'any'),
+            ('Покажи все завершённые встречи', 'completed', 'any'),
+            ('Покажи все законченные встречи', 'completed', 'any'),
+            ('Покажи все невыполненные встречи', 'incomplete', 'any'),
+            ('Покажи все встречи, которые ещё предстоят', 'incomplete', 'future'),
+            ('Покажи прошедшие встречи', 'any', 'past'),
+            ('Покажи выполненные задачи', 'completed', 'any'),
+            ('Покажи невыполненные напоминания', 'incomplete', 'any'),
+        )
+        for message, completion_status, time_scope in cases:
+            with self.subTest(message=message):
+                adapter, _ = self.interpreter({
+                    'turn': 'new', 'action': 'read',
+                    # Deliberately wrong values verify the server-side raw-text guard.
+                    'completion_status': 'completed',
+                    'time_scope': 'future',
+                })
+                result = adapter.interpret(context(message), None)
+                self.assertEqual(result.intent.action, Action.LIST)
+                self.assertEqual(result.intent.target.completion_status,
+                                 completion_status)
+                self.assertEqual(result.intent.target.time_scope, time_scope)
 
     def test_single_update_date_cannot_be_duplicated_into_target(self):
         adapter, _ = self.interpreter({

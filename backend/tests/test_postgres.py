@@ -110,6 +110,51 @@ class PostgresTests(unittest.TestCase):
         with self.assertRaises(DomainError):
             self.service.chat(self.owners[0], request, 'Другой текст')
 
+    def test_list_records_separates_completion_from_time_scope(self):
+        ids = {name: uuid4() for name in (
+            'past_done', 'past_open', 'future_done', 'future_open',
+            'future_task_done', 'future_reminder_open',
+        )}
+        rows = (
+            (ids['past_done'], 'meeting', 'Прошедшая выполненная встреча', '2026-10-26', 'done'),
+            (ids['past_open'], 'meeting', 'Прошедшая невыполненная встреча', '2026-10-26', 'open'),
+            (ids['future_done'], 'meeting', 'Предстоящая выполненная встреча', '2026-10-28', 'done'),
+            (ids['future_open'], 'meeting', 'Предстоящая невыполненная встреча', '2026-10-28', 'open'),
+            (ids['future_task_done'], 'task', 'Выполненная задача', '2026-10-28', 'done'),
+            (ids['future_reminder_open'], 'reminder', 'Невыполненное напоминание', '2026-10-28', 'open'),
+        )
+        with self.repo.connect() as con:
+            for record_id, kind, text, day, status in rows:
+                con.execute('''INSERT INTO records
+                    (id,owner_id,kind,text,scheduled_date,scheduled_time,timezone,
+                     status,source,source_id)
+                    VALUES (%s,%s,%s,%s,%s,'15:00','Europe/Moscow',%s,'test',%s)''',
+                    (record_id, self.owners[0], kind, text, day, status,
+                     str(record_id)))
+
+            def selected(**filters):
+                return {row['id'] for row in self.repo.list_records(
+                    con, self.owners[0], now=self.clock.now(), **filters,
+                )}
+
+            self.assertEqual(selected(kinds=('meeting',),
+                                      completion_status='completed'),
+                             {ids['past_done'], ids['future_done']})
+            self.assertEqual(selected(kinds=('meeting',),
+                                      completion_status='incomplete'),
+                             {ids['past_open'], ids['future_open']})
+            self.assertEqual(selected(kinds=('meeting',), temporal='future',
+                                      completion_status='incomplete'),
+                             {ids['future_open']})
+            self.assertEqual(selected(kinds=('meeting',), temporal='past'),
+                             {ids['past_done'], ids['past_open']})
+            self.assertEqual(selected(kinds=('task',),
+                                      completion_status='completed'),
+                             {ids['future_task_done']})
+            self.assertEqual(selected(kinds=('reminder',),
+                                      completion_status='incomplete'),
+                             {ids['future_reminder_open']})
+
     def test_clarification_survives_service_restart(self):
         result = self.service.chat(self.owners[0], uuid4(), 'без времени')
         self.assertTrue(result['pending'])

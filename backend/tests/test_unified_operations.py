@@ -112,6 +112,40 @@ class ScriptedInterpreter:
                 turn=TurnKind.CONTINUE,
                 intent=OperationIntent(alternative_requested=True),
             )
+        if message == '18:00':
+            return Interpretation(
+                turn=TurnKind.CORRECTION,
+                intent=OperationIntent(
+                    changes=RecordPatch(time_expression='18:00'),
+                    working_hours_override=True,
+                ),
+            )
+        if message == 'создай созвон с альфой':
+            return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
+                action=Action.CREATE,
+                changes=RecordPatch(
+                    kind='meeting', text='Созвон с Альфой по презентации',
+                    date_expression='2026-11-01', time_expression='15:00',
+                    duration=DurationInput(minutes=75),
+                ),
+            ))
+        if message == 'создай встречу с дашей':
+            return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
+                action=Action.CREATE,
+                changes=RecordPatch(
+                    kind='meeting', text='встреча с Дашей',
+                    date_expression='2026-11-01', time_expression='15:00',
+                    duration=DurationInput(minutes=120),
+                ),
+            ))
+        if message == 'на следующий день':
+            return Interpretation(
+                turn=TurnKind.CORRECTION,
+                intent=OperationIntent(changes=RecordPatch(
+                    date_expression='2026-11-02', time_expression='08:00',
+                )),
+                parser_used='deterministic',
+            )
         if message == 'перенеси и переименуй встречу':
             return Interpretation(turn=TurnKind.NEW, intent=OperationIntent(
                 action=Action.UPDATE,
@@ -149,6 +183,8 @@ class UnifiedPostgresTests(unittest.TestCase):
 
     def tearDown(self):
         with self.repo.connect() as con:
+            con.execute('UPDATE sessions SET last_referenced_record_id=NULL WHERE id=%s',
+                        (self.owner,))
             for table in ('chat_requests', 'chat_messages', 'records'):
                 con.execute(f'DELETE FROM {table} WHERE owner_id=%s', (self.owner,))
             con.execute('DELETE FROM sessions WHERE id=%s', (self.owner,))
@@ -164,7 +200,9 @@ class UnifiedPostgresTests(unittest.TestCase):
         created = self.chat('создай первую встречу')
         record_id = created['records'][0]['id']
 
-        proposed = self.chat('перенеси и переименуй встречу')
+        clarification = self.chat('перенеси и переименуй встречу')
+        self.assertIn('после 18:00 или до 08:00', clarification['answer'])
+        proposed = self.chat('18:00')
         self.assertTrue(proposed['pending'])
         self.assertIn('Вы действительно хотите изменить встречу', proposed['answer'])
         self.assertIn('Дата: 29.10.2026 → 30.10.2026', proposed['answer'])
@@ -210,22 +248,38 @@ class UnifiedPostgresTests(unittest.TestCase):
         rows = {row['text']: row for row in self.rows()}
         self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(12))
 
-    def test_confirmation_state_rejects_non_confirmation_text(self):
+    def test_overflow_asks_for_day_and_next_day_rechecks_from_eight(self):
+        self.chat('создай созвон с альфой')
+        waiting = self.chat('создай встречу с дашей')
+        self.assertEqual(
+            waiting['answer'],
+            ('В этот день свободное время есть только после 16:15 '
+             'или до 08:00. Когда вы хотите поставить встречу?'),
+        )
+        self.assertIsNotNone(waiting['pending'])
+        completed = self.chat('на следующий день')
+        self.assertIsNone(completed['pending'])
+        dasha = next(row for row in self.rows() if row['text'] == 'встреча с Дашей')
+        self.assertEqual(dasha['scheduled_date'], date(2026, 11, 2))
+        self.assertEqual(dasha['scheduled_time'], time(8))
+
+    def test_confirmation_state_accepts_alternative_request(self):
         self.chat('создай первую встречу')
         first = self.chat('создай конфликтующую встречу')
         self.assertIn('12:00', first['answer'])
 
         second = self.chat('покажи другое время')
-        self.assertIn('Ответьте «да»', second['answer'])
+        self.assertIn('12:30', second['answer'])
         self.assertEqual(len(self.rows()), 1)
 
         completed = self.chat('да')
         rows = {row['text']: row for row in self.rows()}
-        self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(12))
+        self.assertEqual(rows['Встреча с Катей']['scheduled_time'], time(12, 30))
 
     def test_read_has_no_write_and_cancel_needs_confirmation(self):
         self.chat('создай первую встречу')
         self.chat('перенеси и переименуй встречу')
+        self.chat('18:00')
         self.chat('да')
         version = self.rows()[0]['version']
 
@@ -237,7 +291,7 @@ class UnifiedPostgresTests(unittest.TestCase):
         self.assertTrue(proposed['pending'])
         self.assertEqual(len(self.rows()), 1)
         completed = self.chat('да')
-        self.assertIn('отменена', completed['answer'])
+        self.assertIn('Событие удалено', completed['answer'])
         self.assertEqual(self.rows(), [])
 
     def test_request_id_replay_does_not_repeat_create(self):
@@ -288,6 +342,8 @@ class UnifiedPostgresTests(unittest.TestCase):
             )
         finally:
             with self.repo.connect() as con:
+                con.execute('UPDATE sessions SET last_referenced_record_id=NULL WHERE id=%s',
+                            (owner,))
                 for table in ('chat_requests', 'chat_messages', 'records'):
                     con.execute(f'DELETE FROM {table} WHERE owner_id=%s', (owner,))
                 con.execute('DELETE FROM sessions WHERE id=%s', (owner,))

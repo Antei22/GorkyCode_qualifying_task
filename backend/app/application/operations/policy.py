@@ -58,6 +58,7 @@ class DefaultOperationPolicy:
             )
         if intent.ambiguous_fields:
             fields = set(intent.ambiguous_fields)
+            evidence = (intent.ambiguity_evidence or '').strip()
             if fields == {'kind'}:
                 labels = {
                     'task': 'задача', 'meeting': 'встреча',
@@ -71,11 +72,14 @@ class DefaultOperationPolicy:
                     )
                 else:
                     question = _QUESTIONS['kind']
+            elif (intent.changes.kind == 'reminder'
+                  and 'time_expression' in fields and evidence):
+                question = (f'«{evidence}» — это время напоминания '
+                            'или часть текста?')
             elif fields == {'time_expression', 'duration'}:
-                question = (
-                    'Уточните: указанное значение означает время начала '
-                    'или длительность встречи?'
-                )
+                cited = f'«{evidence}»' if evidence else 'указанный фрагмент'
+                question = (f'Что вы имеете в виду под {cited}: '
+                            'длительность встречи или время начала?')
             else:
                 labels = {
                     'kind': 'тип записи', 'text': 'текст',
@@ -83,7 +87,13 @@ class DefaultOperationPolicy:
                     'timezone': 'часовой пояс', 'duration': 'длительность',
                 }
                 names = ', '.join(labels[item] for item in intent.ambiguous_fields)
-                question = f'Уточните неоднозначные параметры: {names}.'
+                cited = f' во фрагменте «{evidence}»' if evidence else ''
+                question = f'Уточните неоднозначные параметры{cited}: {names}.'
+            context.trace.update({
+                'ambiguous_span': evidence or None,
+                'candidate_roles': list(intent.ambiguous_fields),
+                'clarification_text': question,
+            })
             return PolicyDecision(
                 phase=Phase.NEED_FIELDS,
                 missing_fields=tuple(intent.ambiguous_fields),
@@ -179,7 +189,14 @@ class DefaultOperationPolicy:
                 if intent.action == Action.UPDATE:
                     question = build_update_confirmation(plan.before, plan.after)
                 else:
-                    question = 'Подтвердите: отменить запись?'
+                    before = plan.before
+                    when = ''
+                    if before and before.scheduled_date:
+                        when = f' — {before.scheduled_date:%d.%m.%Y}'
+                        if before.scheduled_time:
+                            when += f' в {before.scheduled_time:%H:%M}'
+                    question = (f'Подтвердите удаление события '
+                                f'«{before.text if before else ""}»{when}?')
                 return PolicyDecision(
                     phase=Phase.NEED_CONFIRMATION,
                     question=question,

@@ -46,12 +46,27 @@ class OperationCoordinator:
         if pending is not None and pending.phase == Phase.NEED_CONFIRMATION:
             turn = ConfirmationResolver.resolve(context.message)
             interpretation = None
+            if turn == TurnKind.UNKNOWN:
+                interpretation = self.interpreter.interpret(context, pending)
+                turn = interpretation.turn
             context.trace.update({
-                'parser_used': 'confirmation_resolver',
+                'parser_used': ('confirmation_resolver' if interpretation is None
+                                else interpretation.parser_used),
                 'confirmation_decision': {
                     TurnKind.CONFIRM: 'confirm', TurnKind.REJECT: 'reject',
+                    TurnKind.CORRECTION: 'correction',
                 }.get(turn, 'unknown'),
-                'llm_output': None,
+                'decision': {
+                    TurnKind.CONFIRM: 'confirm', TurnKind.REJECT: 'reject',
+                    TurnKind.CORRECTION: 'correction',
+                }.get(turn, 'unknown'),
+                'correction_patch': (
+                    interpretation.intent.changes.model_dump(
+                        mode='json', exclude_unset=True,
+                    ) if interpretation is not None and interpretation.intent else None
+                ),
+                'llm_output': (interpretation.llm_output
+                               if interpretation is not None else None),
             })
         else:
             interpretation = self.interpreter.interpret(context, pending)
@@ -65,7 +80,8 @@ class OperationCoordinator:
                     'updated_at': context.now,
                     'expires_at': context.now + self.pending_ttl,
                 }),
-                question='Ответьте «да» для подтверждения или «нет» для отказа.',
+                question=('Ответьте «да» для подтверждения, «нет» для отказа '
+                          'или укажите исправленные данные.'),
             )
 
         resolved_conflict_intent = None
@@ -183,6 +199,32 @@ class OperationCoordinator:
             intent = interpretation.intent or OperationIntent()
             pending = None
 
+<<<<<<< Updated upstream
+=======
+        if (turn == TurnKind.CONFIRM and pending is not None
+                and pending.proposed_batch is not None):
+            batch = pending.proposed_batch
+            if batch.fingerprint != batch_fingerprint(batch.action, batch.plans):
+                return OperationOutcome(
+                    phase=Phase.REJECTED,
+                    issues=(ValidationIssue(code='invalid_batch_fingerprint', message='Пакет изменений повреждён.'),),
+                )
+            records = []
+            for saved_plan in batch.plans:
+                execution = self.executor.execute(context, saved_plan)
+                if execution.action != saved_plan.action or len(execution.records) != 1:
+                    raise RuntimeError('operation executor returned a different batch action')
+                records.extend(execution.records)
+            executed = tuple(records)
+            logger.info('batch_confirmed action=%s ids=%s', batch.action,
+                        [str(item.id) for item in executed])
+            context.trace['confirmed_ids'] = [str(item.id) for item in executed]
+            return OperationOutcome(
+                phase=Phase.COMPLETED, records=executed,
+                execution=ExecutionResult(action=batch.action, records=executed),
+            )
+
+>>>>>>> Stashed changes
         if intent.action == Action.UNKNOWN:
             decision = self.policy.evaluate(context, intent, None, pending)
             return self._from_decision(context, intent, decision, pending)
@@ -248,7 +290,13 @@ class OperationCoordinator:
                 )
                 return self._from_decision(context, intent, decision, pending)
 
+<<<<<<< Updated upstream
         if intent.action in (Action.UPDATE, Action.CANCEL):
+=======
+        if (intent.action in (Action.UPDATE, Action.CANCEL, Action.COMPLETE, Action.REOPEN)
+                and not (intent.action in (Action.CANCEL, Action.COMPLETE, Action.REOPEN)
+                         and intent.all_matches)):
+>>>>>>> Stashed changes
             candidates = resolution.candidates
             if selected_id is not None:
                 target = next((item for item in candidates if item.id == selected_id), None)
@@ -266,13 +314,54 @@ class OperationCoordinator:
                     context, intent, pending, (), 'target_not_found',
                     'Подходящая запись не найдена. Уточните название или дату.',
                 )
+<<<<<<< Updated upstream
             if selected_id is not None:
                 context.trace['selected_id'] = str(selected_id)
+=======
+>>>>>>> Stashed changes
             else:
                 return self._need_target(
                     context, intent, pending, candidates, 'target_ambiguous',
                     'Найдено несколько записей. Какую именно выбрать?',
                 )
+<<<<<<< Updated upstream
+=======
+
+        if intent.action in (Action.CANCEL, Action.COMPLETE, Action.REOPEN) and intent.all_matches:
+            candidates = resolution.candidates
+            if not candidates:
+                return self._need_target(context, intent, pending, (), 'target_not_found',
+                                         'Подходящих записей не найдено. Уточните название или дату.')
+            plans = tuple(self.planner.prepare(context, intent, item) for item in candidates)
+            batch = BatchChangePlan(
+                action=intent.action.value,
+                plans=plans,
+                fingerprint=batch_fingerprint(intent.action.value, plans),
+            )
+            state = self._pending(
+                context, intent, Phase.NEED_CONFIRMATION, pending,
+                candidate_ids=tuple(item.id for item in candidates),
+                plan=None, proposed_batch=batch,
+            )
+            if intent.action == Action.CANCEL:
+                question = f'Подтвердите удаление этих {len(plans)} событий?'
+            else:
+                verb = ('выполненными' if intent.action == Action.COMPLETE
+                        else 'в активные')
+                question = f'Отметить {verb} все {len(plans)}?'
+            frozen_ids = [str(item.id) for item in candidates]
+            context.trace.update({
+                'bulk_action': intent.action.value,
+                'matched_ids': frozen_ids,
+                'frozen_ids': frozen_ids,
+            })
+            logger.info('batch_preview action=%s matched_ids=%s frozen_ids=%s',
+                        intent.action.value, frozen_ids, frozen_ids)
+            return OperationOutcome(
+                phase=Phase.NEED_CONFIRMATION, pending=state,
+                question=question, records=candidates,
+            )
+>>>>>>> Stashed changes
 
         if intent.action == Action.READ:
             if (intent.read_fields and selected_id is None
@@ -371,12 +460,18 @@ class OperationCoordinator:
             return OperationOutcome(phase=decision.phase, question=decision.question,
                                     issues=decision.issues)
         state = self._pending(context, intent, decision.phase, previous,
-                              candidate_ids, selected_id, plan)
+                              candidate_ids, selected_id, plan,
+                              calendar_clarification=decision.calendar_clarification)
         return OperationOutcome(phase=decision.phase, pending=state,
                                 question=decision.question, issues=decision.issues)
 
     def _pending(self, context, intent, phase, previous, candidate_ids=(),
+<<<<<<< Updated upstream
                  selected_id=None, plan=None, pending_changes=()):
+=======
+                 selected_id=None, plan=None, pending_changes=(), proposed_batch=None,
+                 calendar_clarification=None):
+>>>>>>> Stashed changes
         created_at = previous.created_at if previous else context.now
         return PendingOperation(
             operation_id=previous.operation_id if previous else self.operation_id_factory(),
@@ -386,6 +481,7 @@ class OperationCoordinator:
             selected_record_id=selected_id,
             proposed_plan=plan,
             pending_changes=tuple(pending_changes),
+            calendar_clarification=calendar_clarification,
             created_at=created_at,
             updated_at=context.now,
             expires_at=context.now + self.pending_ttl,

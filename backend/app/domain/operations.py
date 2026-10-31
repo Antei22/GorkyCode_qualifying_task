@@ -31,6 +31,7 @@ KindSource = Literal[
 DurationStatus = Literal[
     'missing', 'provided', 'declined_to_specify', 'defaulted',
 ]
+DEFAULT_PAGE_SIZE = 20
 
 
 class Contract(BaseModel):
@@ -133,6 +134,19 @@ class TargetQuery(Contract):
     temporal: Literal['future', 'past', 'all', 'unspecified'] | ParsedDate = 'unspecified'
     date_expression: str | None = None
     time_expression: str | None = None
+<<<<<<< Updated upstream
+=======
+    # Structural person constraint; never substitute an unrelated semantic hit.
+    person: str | None = None
+    person_label: str | None = None
+    result_limit: int | None = Field(default=None, ge=1, le=100)
+    completion_status: Literal['completed', 'incomplete', 'any'] = 'any'
+    time_scope: Literal['future', 'past', 'any'] = 'any'
+    ordering_direction: Literal['asc', 'desc'] = 'asc'
+    # Server-owned continuation/bulk fields; they are not part of the LLM schema.
+    record_ids: tuple[UUID, ...] = ()
+    page_offset: int = Field(default=0, ge=0)
+>>>>>>> Stashed changes
 
 
 class OperationIntent(Contract):
@@ -159,6 +173,13 @@ class OperationIntent(Contract):
     resolved_ambiguity: OperationField | None = None
     # Transient negotiation signal for a different proposed calendar slot.
     alternative_requested: bool = False
+<<<<<<< Updated upstream
+=======
+    all_matches: bool = False
+    # Transient permission set only when the user explicitly chooses a time
+    # outside the automatic 08:00-18:00 suggestion window.
+    working_hours_override: bool = False
+>>>>>>> Stashed changes
 
 
 class Interpretation(Contract):
@@ -235,6 +256,7 @@ class PolicyDecision(Contract):
     question: str | None = None
     alternative_plan: ChangePlan | None = None
     alternative_intent: OperationIntent | None = None
+    calendar_clarification: Literal['working_window'] | None = None
 
     @model_validator(mode='after')
     def validate_alternative(self):
@@ -265,6 +287,7 @@ class PendingOperation(Contract):
     proposed_plan: ChangePlan | None = None
     confirmed_fingerprint: str | None = None
     pending_changes: tuple[PendingChange, ...] = ()
+    calendar_clarification: Literal['working_window'] | None = None
     created_at: datetime
     updated_at: datetime
     expires_at: datetime
@@ -327,3 +350,24 @@ def make_change_plan(action: Literal['create', 'update', 'cancel'],
     """Build a plan whose fingerprint cannot be supplied by the model/client."""
     return ChangePlan(action=action, before=before, after=after,
                       fingerprint=plan_fingerprint(action, before, after))
+<<<<<<< Updated upstream
+=======
+
+
+class BatchChangePlan(Contract):
+    action: Literal['cancel', 'complete', 'reopen']
+    plans: tuple[ChangePlan, ...] = Field(min_length=1)
+    fingerprint: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+def batch_fingerprint(action: str, plans: tuple[ChangePlan, ...]) -> str:
+    import json
+    payload = {'action': action, 'plans': [
+        {'id': str(plan.after.id), 'fingerprint': plan.fingerprint} for plan in plans
+    ]}
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+PendingOperation.model_rebuild()
+>>>>>>> Stashed changes

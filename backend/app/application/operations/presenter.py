@@ -1,7 +1,7 @@
 """Deterministic presentation of server-owned operation facts."""
 from dataclasses import dataclass
 
-from app.domain.operations import Action, OperationOutcome, Phase
+from app.domain.operations import Action, DEFAULT_PAGE_SIZE, OperationOutcome, Phase
 from .ports import TurnContext
 
 
@@ -15,12 +15,21 @@ _CANCELLED = {'task': 'Задача отменена', 'meeting': 'Встреч�
 
 @dataclass(frozen=True)
 class DefaultOutcomePresenter:
-    max_records: int = 10
+    max_records: int = DEFAULT_PAGE_SIZE
 
     def present(self, context: TurnContext, outcome: OperationOutcome) -> str:
         if outcome.question:
             if outcome.records:
-                return outcome.question + '\n' + self._record_lines(outcome.records)
+                if outcome.pending and outcome.pending.proposed_batch:
+                    noun = ('событий' if outcome.pending.proposed_batch.action == 'cancel'
+                            else 'записей')
+                    return (f'Найдено {len(outcome.records)} {noun}:\n'
+                            + self._record_lines(
+                                outcome.records, context, show_all=True,
+                            ) + f'\n\n{outcome.question}')
+                return outcome.question + '\n' + self._record_lines(
+                    outcome.records, context, show_all=True,
+                )
             return outcome.question
         if outcome.phase == Phase.REJECTED:
             return (outcome.issues[0].message if outcome.issues
@@ -28,9 +37,29 @@ class DefaultOutcomePresenter:
         if outcome.phase != Phase.COMPLETED:
             return 'Уточните параметры операции.'
         if outcome.execution is not None:
+<<<<<<< Updated upstream
+=======
+            if outcome.execution.action in (Action.COMPLETE.value, Action.REOPEN.value):
+                if len(outcome.execution.records) > 1:
+                    heading = (f'Отмечено выполненными: {len(outcome.execution.records)} записей.'
+                            if outcome.execution.action == Action.COMPLETE.value
+                            else f'Возвращено в активные: {len(outcome.execution.records)} записей.')
+                    return heading + '\n' + self._record_lines(
+                        outcome.execution.records, context, show_all=True,
+                    )
+                record = outcome.execution.records[0]
+                return (f'Запись выполнена: «{record.text}».'
+                        if outcome.execution.action == Action.COMPLETE.value
+                        else f'Запись возвращена в активные: «{record.text}».')
+>>>>>>> Stashed changes
             record = outcome.execution.records[0]
             if outcome.execution.action == Action.CANCEL.value:
-                return f'{_CANCELLED[record.kind]}: «{record.text}».'
+                if len(outcome.execution.records) > 1:
+                    return (f'Удалено {len(outcome.execution.records)} событий:\n'
+                            + self._record_lines(
+                                outcome.execution.records, context, show_all=True,
+                            ))
+                return f'Событие удалено:\n«{record.text}»{self._when(record)}.'
             label = (_CREATED[record.kind] if outcome.execution.action == Action.CREATE.value
                      else _UPDATED[record.kind])
             return (f'{label}: «{record.text}»{self._when(record)}.'
@@ -39,13 +68,22 @@ class DefaultOutcomePresenter:
             return 'Подходящих записей не найдено.'
         if 'duration' in outcome.read_fields:
             return '\n'.join(self._duration_line(item, context) for item in outcome.records)
+<<<<<<< Updated upstream
         return self._record_lines(outcome.records)
+=======
+        lines = self._record_lines(outcome.records, context)
+        if outcome.total_count is not None and outcome.total_count > len(outcome.records):
+            return (f'Найдено {outcome.total_count} записей. '
+                    f'Показываю первые {len(outcome.records)}:\n{lines}\n'
+                    'Показать ещё можно отдельным запросом.')
+        return lines
+>>>>>>> Stashed changes
 
-    def _record_lines(self, records):
+    def _record_lines(self, records, context, show_all=False):
+        offset = int(context.trace.get('page_offset') or 0)
+        visible = records if show_all else records[:self.max_records]
         lines = [f'{index}. {item.text}{self._when(item)}'
-                 for index, item in enumerate(records[:self.max_records], 1)]
-        if len(records) > self.max_records:
-            lines.append('Уточните запрос, чтобы сократить список.')
+                 for index, item in enumerate(visible, offset + 1)]
         return '\n'.join(lines)
 
     @staticmethod
